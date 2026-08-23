@@ -12,8 +12,19 @@ def run_inference(args):
     # 1. Tải mô hình YOLO
     model_path = args.model
     if not os.path.exists(model_path):
-        print(f"Cảnh báo: Không tìm thấy checkpoint tại {model_path}. Chuyển sang dùng model pre-trained mặc định.")
-        model_path = "yolo11s.pt"
+        fallback_models = [
+            "weights/best.pt",
+            "runs/detect/runs/detect/train_safety_150/weights/best.pt",
+            "runs/detect/train_safety/weights/best.pt",
+            "yolo11s.pt"
+        ]
+        for p in fallback_models:
+            if os.path.exists(p):
+                model_path = p
+                break
+        else:
+            print(f"Cảnh báo: Không tìm thấy checkpoint tại {model_path}. Tự động tải yolo11s.pt.")
+            model_path = "yolo11s.pt"
     
     model = YOLO(model_path)
     print(f"Đã tải thành công mô hình từ: {model_path}")
@@ -21,13 +32,19 @@ def run_inference(args):
     # 2. Xử lý nguồn dữ liệu đầu vào (Inference Source)
     source = args.source
     # Kiểm tra xem có phải là webcam hay không (0, 1, 2...)
-    if source.isdigit():
+    if str(source).isdigit():
         source = int(source)
         print(f"Đang mở Webcam: {source}")
     else:
-        source = os.path.abspath(source)
         if not os.path.exists(source):
-            raise FileNotFoundError(f"Không tìm thấy nguồn dữ liệu đầu vào: {source}")
+            # Fallback sang sample_images nếu đường dẫn chỉ định không tồn tại
+            if os.path.exists("data/sample_images"):
+                source = os.path.abspath("data/sample_images")
+                print(f"Không tìm thấy nguồn ban đầu, chuyển sang dùng ảnh mẫu tại: {source}")
+            else:
+                raise FileNotFoundError(f"Không tìm thấy nguồn dữ liệu đầu vào: {source}")
+        else:
+            source = os.path.abspath(source)
         print(f"Đang chạy inference nguồn: {source}")
 
     # 3. Chạy dự đoán sử dụng generator stream=True của Ultralytics (Tiết kiệm RAM khi chạy video/webcam)
@@ -139,9 +156,9 @@ def run_inference(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="YOLO11 Real-time PPE Safety Inference Script")
     
-    parser.add_argument("--model", type=str, default="runs/detect/train_safety/weights/best.pt",
-                        help="Đường dẫn đến file trọng số .pt của mô hình đã train")
-    parser.add_argument("--source", type=str, default="data/ppe_dataset/test/images",
+    parser.add_argument("--model", type=str, default="weights/best.pt",
+                        help="Đường dẫn đến file trọng số .pt của mô hình đã train (mặc định: weights/best.pt)")
+    parser.add_argument("--source", type=str, default="data/sample_images",
                         help="Nguồn đầu vào: Đường dẫn ảnh, thư mục ảnh, file video (.mp4) hoặc số '0' cho Webcam")
     parser.add_argument("--conf", type=float, default=0.25,
                         help="Ngưỡng độ tin cậy để hiển thị phát hiện (Confidence Threshold)")

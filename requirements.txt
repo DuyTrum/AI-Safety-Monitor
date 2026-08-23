@@ -4,4 +4,11 @@ torchvision
 opencv-python
 matplotlib
 pandas
+openpyxl
+requests
 pyyaml
+fastapi
+uvicorn
+websockets
+psycopg2-binary
+pydantic

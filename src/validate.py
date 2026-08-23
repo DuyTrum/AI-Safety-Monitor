@@ -7,7 +7,18 @@ def run_validation(args):
     # 1. Tải mô hình YOLO
     model_path = args.model
     if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Không tìm thấy file trọng số của mô hình tại: {model_path}")
+        fallback_models = [
+            "weights/best.pt",
+            "runs/detect/runs/detect/train_safety_150/weights/best.pt",
+            "runs/detect/train_safety/weights/best.pt",
+            "yolo11s.pt"
+        ]
+        for p in fallback_models:
+            if os.path.exists(p):
+                model_path = p
+                break
+        else:
+            raise FileNotFoundError(f"Không tìm thấy file trọng số của mô hình tại: {model_path}")
     
     model = YOLO(model_path)
     print(f"Đã tải thành công mô hình từ: {model_path}")
@@ -68,8 +79,8 @@ def run_validation(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="YOLO11 Detailed Evaluation/Validation Script")
     
-    parser.add_argument("--model", type=str, default="runs/detect/train_safety/weights/best.pt",
-                        help="Đường dẫn tới mô hình cần đánh giá (.pt)")
+    parser.add_argument("--model", type=str, default="weights/best.pt",
+                        help="Đường dẫn tới mô hình cần đánh giá (.pt) (mặc định: weights/best.pt)")
     parser.add_argument("--data", type=str, default="data/ppe_dataset/data.yaml",
                         help="Đường dẫn đến file data.yaml")
     parser.add_argument("--split", type=str, default="test", choices=["val", "test", "train"],

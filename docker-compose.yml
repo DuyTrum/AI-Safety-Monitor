@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  # Cơ sở dữ liệu PostgreSQL
+  db:
+    image: postgres:15-alpine
+    container_name: safety-monitor-db
+    environment:
+      - POSTGRES_DB=safety_monitor
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    restart: always
+
+  # Dịch vụ Backend FastAPI chạy YOLO11
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: safety-monitor-backend
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/safety_monitor
+      - MODEL_PATH=weights/best.pt
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./runs:/app/runs
+      - ./data:/app/data
+      - ./configs:/app/configs
+      - ./weights:/app/weights
+    depends_on:
+      - db
+    restart: always
+
+  # Dịch vụ Frontend React + Nginx
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: safety-monitor-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: always
+
+volumes:
+  postgres_data:

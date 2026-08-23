@@ -1,0 +1,23 @@
+{
+  "notifications": {
+    "telegram_enabled": false,
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
+    "webhook_enabled": false,
+    "webhook_url": "",
+    "notify_violations": [
+      "no-helmet",
+      "no-vest",
+      "no-gloves",
+      "no-boots",
+      "no-goggles"
+    ],
+    "active_rules": {
+      "helmet": true,
+      "vest": true,
+      "boots": false,
+      "gloves": false,
+      "goggles": false
+    }
+  }
+}
