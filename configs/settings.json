@@ -5,6 +5,7 @@
     "telegram_chat_id": "",
     "webhook_enabled": false,
     "webhook_url": "",
+    "snapshot_cooldown": 15,
     "notify_violations": [
       "no-helmet",
       "no-vest",

@@ -24,10 +24,12 @@ from ultralytics import YOLO
 from src.utils.snapshot import save_violation_snapshot, SNAPSHOT_BASE_DIR
 from src.utils.notifier import (
     send_violation_alert,
+    send_test_telegram,
     load_notification_config,
-    save_notification_config
+    save_notification_config,
 )
 from src.utils.reporter import generate_violation_report
+from src.utils.tracker import RobustViolationTracker
 
 # Cấu hình logging
 logging.basicConfig(
@@ -113,6 +115,7 @@ class NotificationSettingsModel(BaseModel):
     telegram_chat_id: str = ""
     webhook_enabled: bool = False
     webhook_url: str = ""
+    snapshot_cooldown: int = 15
     notify_violations: List[str] = ["no-helmet", "no-vest", "no-gloves", "no-boots", "no-goggles"]
     active_rules: Dict[str, bool] = {
         "helmet": True,
@@ -121,6 +124,10 @@ class NotificationSettingsModel(BaseModel):
         "gloves": False,
         "goggles": False
     }
+
+class TelegramTestRequest(BaseModel):
+    token: Optional[str] = None
+    chat_id: Optional[str] = None
 
 # Quản lý dữ liệu Vi phạm (Violations Database sử dụng PostgreSQL)
 class ViolationDB:
@@ -338,6 +345,16 @@ def update_notification_settings(settings: NotificationSettingsModel):
         return {"status": "success", "message": "Đã lưu cấu hình thông báo mới."}
     return {"status": "error", "message": "Lỗi khi lưu cấu hình."}
 
+@app.post("/api/settings/notifications/test-telegram")
+def test_telegram_notification(req: Optional[TelegramTestRequest] = None):
+    """Kiểm tra kết nối và gửi tin nhắn thử nghiệm tới Telegram Bot."""
+    token = req.token if req else None
+    chat_id = req.chat_id if req else None
+    success, message = send_test_telegram(token=token, chat_id=chat_id)
+    if success:
+        return {"status": "success", "message": message}
+    return {"status": "error", "message": message}
+
 
 # Quản lý WebSocket Streams
 class ConnectionManager:
@@ -362,20 +379,22 @@ manager = ConnectionManager()
 
 
 def process_frame(
-    frame: cv2.Mat, use_tracking: bool = True, active_rules: Optional[Dict[str, bool]] = None
-) -> tuple[cv2.Mat, List[str], Dict[str, bool], List[tuple[str, float, Optional[int]]]]:
-    """Chạy suy luận YOLO11 (kèm ByteTrack tracking) trên khung hình và vẽ bounding box.
+    frame: cv2.Mat,
+    tracker: Optional[RobustViolationTracker] = None,
+    active_rules: Optional[Dict[str, bool]] = None,
+) -> tuple[cv2.Mat, List[str], Dict[str, bool], List[tuple[str, float, int, bool]]]:
+    """Chạy suy luận YOLO11 và theo dõi ID đối tượng bằng RobustViolationTracker.
     
     Args:
         frame: Ảnh gốc từ camera (OpenCV Mat).
-        use_tracking: Có sử dụng ByteTrack tracking hay không.
+        tracker: Bộ theo dõi đối tượng Spatial-Temporal RobustViolationTracker.
         active_rules: Dictionary cấu hình bật/tắt các quy định bảo hộ.
         
     Returns:
         frame_out: Ảnh đã được vẽ bounding box và cảnh báo.
         violations: Danh sách các lớp vi phạm phát hiện trong frame.
         current_detections: Trạng thái an toàn của từng loại trang bị.
-        raw_violations: Danh sách tuple chứa (tên_lớp, độ_tin_cậy, track_id) của vi phạm.
+        raw_violations: Danh sách tuple chứa (class_name, confidence, track_id, is_already_alerted).
     """
     if active_rules is None:
         config = load_notification_config()
@@ -383,23 +402,6 @@ def process_frame(
             "helmet": True, "vest": True, "boots": False, "gloves": False, "goggles": False
         })
 
-    if model is None:
-        return frame, [], {cls: False for cls in SAFE_CLASSES}, []
-
-    # Chạy YOLO11 với Object Tracking (ByteTrack) nếu enabled
-    try:
-        if use_tracking:
-            results = model.track(frame, conf=0.25, persist=True, verbose=False)
-        else:
-            results = model(frame, conf=0.25, verbose=False)
-    except Exception as e:
-        logger.warning(f"Không thể khởi chạy Object Tracking, dùng suy luận mặc định: {e}")
-        results = model(frame, conf=0.25, verbose=False)
-
-    violations = []
-    raw_violations = []
-
-    # Khởi tạo trạng thái phát hiện hiện tại
     current_detections = {
         "helmet": False,
         "vest": False,
@@ -408,73 +410,91 @@ def process_frame(
         "goggles": False
     }
 
-    if not results:
-        return frame, violations, current_detections, raw_violations
+    if model is None or frame is None or frame.size == 0:
+        return frame, [], current_detections, []
 
-    result = results[0]
-    boxes = result.boxes
+    # 1. Chạy YOLO11 phát hiện đối tượng
+    try:
+        results = model(frame, conf=0.25, verbose=False)
+    except Exception as e:
+        logger.error(f"Lỗi suy luận YOLO: {e}")
+        return frame, [], current_detections, []
 
-    for box in boxes:
-        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-        conf = float(box.conf[0])
-        class_id = int(box.cls[0])
-        class_name = model.names[class_id]
+    raw_detections = []
+    if results and len(results) > 0:
+        boxes = results[0].boxes
+        for box in boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            conf = float(box.conf[0])
+            class_id = int(box.cls[0])
+            class_name = model.names[class_id]
 
-        track_id = None
-        if hasattr(box, "id") and box.id is not None:
-            try:
-                track_id = int(box.id[0])
-            except Exception:
-                track_id = None
-
-        # Phân loại an toàn vs vi phạm
-        if class_name in UNSAFE_CLASSES:
+            # Kiểm tra quy định bảo hộ tương ứng có đang BẬT không
             base_rule = class_name.replace("no-", "")
-            # Lọc bỏ nếu quy định bảo hộ tương ứng đang TẮT
             if not active_rules.get(base_rule, True):
                 continue
 
-            color = COLORS["unsafe"]
-            track_str = f" #{track_id}" if track_id is not None else ""
-            label = f"VI PHAM: {class_name}{track_str} ({conf:.2f})"
+            raw_detections.append(((x1, y1, x2, y2), class_name, conf))
+
+    # 2. Cập nhật qua Spatial-Temporal Tracker để gán ID bền vững
+    tracked_items = []
+    if tracker is not None:
+        tracked_items = tracker.update(raw_detections, timestamp=time.time())
+    else:
+        for idx, (bbox, cname, cconf) in enumerate(raw_detections):
+            tracked_items.append((idx + 1, bbox, cname, cconf, False))
+
+    violations = []
+    raw_violations = []
+
+    # 3. Vẽ Bounding Box trực quan
+    for track_id, (x1, y1, x2, y2), class_name, conf, is_alerted in tracked_items:
+        base_rule = class_name.replace("no-", "")
+
+        if class_name in UNSAFE_CLASSES:
             violations.append(class_name)
-            raw_violations.append((class_name, conf, track_id))
-        else:
-            base_rule = class_name
-            # Lọc bỏ nếu quy định bảo hộ tương ứng đang TẮT
-            if not active_rules.get(base_rule, True):
-                continue
+            raw_violations.append((class_name, conf, track_id, is_alerted))
 
-            color = COLORS["safe"]
-            track_str = f" #{track_id}" if track_id is not None else ""
-            label = f"{class_name}{track_str} ({conf:.2f})"
-            # Ghi nhận trạng thái an toàn
+            if is_alerted:
+                # Đã cảnh báo rồi: Viền cam đậm, ghi rõ [ID #X] VI PHAM (DA BAO)
+                color = (0, 140, 255)  # BGR Orange
+                status_text = "DA BAO"
+            else:
+                # Chưa cảnh báo: Viền đỏ rực, ghi rõ [ID #X] VI PHAM (MOI)
+                color = COLORS["unsafe"]  # BGR Red
+                status_text = "MOI"
+
+            label = f"[ID #{track_id}] {class_name.upper()} ({status_text}) {conf:.2f}"
+        else:
+            # Trang bị an toàn
+            color = COLORS["safe"]  # BGR Green
+            label = f"[ID #{track_id}] {class_name} ({conf:.2f})"
             if base_rule in current_detections:
                 current_detections[base_rule] = True
 
-        # Vẽ bounding box lên ảnh
+        # Vẽ hình chữ nhật bounding box
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-        # Vẽ label background
-        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
-        cv2.rectangle(frame, (x1, y1 - 20), (x1 + text_size[0], y1), color, -1)
+        # Vẽ nền label
+        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+        cv2.rectangle(frame, (x1, y1 - 22), (x1 + text_size[0] + 6, y1), color, -1)
 
         # Viết text label
-        cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, label, (x1 + 3, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
-    # Hiển thị thông tin cảnh báo trực tiếp trên ảnh
+    # Hiển thị thông tin cảnh báo tổng quan góc trên bên trái
     if violations:
-        violation_text = f"CANH BAO: Phat hien {len(violations)} vi pham!"
-        cv2.putText(frame, violation_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLORS["unsafe"], 2)
+        violation_text = f"CANH BAO: {len(violations)} vi pham!"
+        cv2.putText(frame, violation_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, COLORS["unsafe"], 2)
     else:
-        cv2.putText(frame, "AN TOAN LAO DONG", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLORS["safe"], 2)
+        cv2.putText(frame, "AN TOAN LAO DONG", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, COLORS["safe"], 2)
 
     return frame, violations, current_detections, raw_violations
 
 
 @app.websocket("/api/ws/stream")
 async def websocket_stream(websocket: WebSocket, source: str = "0"):
-    """WebSocket endpoint truyền trực tiếp video/webcam đã qua xử lý YOLO.
+    """WebSocket endpoint truyền trực tiếp video/webcam đã qua xử lý YOLO & RobustTracker.
     
     Args:
         websocket: Đối tượng kết nối WebSocket.
@@ -482,6 +502,9 @@ async def websocket_stream(websocket: WebSocket, source: str = "0"):
     """
     await manager.connect(websocket)
     
+    # Tạo một instance RobustViolationTracker riêng biệt cho phiên stream này
+    tracker = RobustViolationTracker(max_disappear_seconds=30.0)
+
     # Xác định nguồn video đầu vào
     if source.isdigit():
         video_source = int(source)
@@ -489,7 +512,6 @@ async def websocket_stream(websocket: WebSocket, source: str = "0"):
     else:
         video_source = os.path.abspath(source)
         if not os.path.exists(video_source):
-            # Nếu không tìm thấy tệp video cụ thể, thử tìm trong thư mục test images
             logger.warning(f"Không tìm thấy video: {video_source}. Sử dụng giả lập chuỗi ảnh test.")
             video_source = "mock"
         else:
@@ -528,16 +550,6 @@ async def websocket_stream(websocket: WebSocket, source: str = "0"):
                     logger.info(f"Đã nạp {len(mock_images)} ảnh giả lập từ '{cdir}' cho luồng WebSocket.")
                     break
 
-    # Quản lý trạng thái vi phạm liên tục & ByteTrack để tránh lặp vi phạm khi 1 người đứng trong khung hình
-    logged_track_violations: set = set()      # Set chứa các tuple (track_id, v_type) đã được ghi DB
-    track_last_seen: Dict[int, float] = {}     # Thời điểm thấy track_id gần nhất
-
-    active_type_counts: Dict[str, int] = {}    # Fallback: đếm số lượng vi phạm hiện tại từng loại
-    last_type_seen: Dict[str, float] = {}
-
-    TRACK_EXPIRATION_SECONDS = 5.0  # Hết hạn theo dõi nếu đối tượng rời khỏi khung hình > 5s
-    TYPE_PERSISTENCE_SECONDS = 3.0  # Hết hạn vi phạm fallback nếu không thấy > 3s
-
     try:
         while True:
             frame = None
@@ -545,24 +557,21 @@ async def websocket_stream(websocket: WebSocket, source: str = "0"):
             if cap is not None and cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
-                    # Nếu hết video, cuộn lại từ đầu (loop video)
                     if isinstance(video_source, str):
                         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         continue
                     else:
                         break
             elif mock_images:
-                # Đọc ảnh giả lập tuần hoàn
+                # Đọc ảnh giả lập tuần hoàn với nhịp 1.5s mỗi ảnh để quan sát rõ ràng
                 img_path = mock_images[mock_idx % len(mock_images)]
                 frame = cv2.imread(img_path)
                 mock_idx += 1
-                # Giả lập FPS cho luồng ảnh mock (~10 FPS để người dùng dễ xem)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(1.5)
             else:
-                # Không có camera lẫn dữ liệu mock hoặc camera mở lỗi
                 logger.error("Không tìm thấy nguồn video hay ảnh giả lập khả dụng.")
                 await websocket.send_json({
-                    "error": "Không thể kết nối tới Camera này. Vui lòng kiểm tra cổng cắm, đảm bảo camera không bị ứng dụng khác chiếm dụng, hoặc thử đổi Webcam ID khác (ID 1, ID 2)."
+                    "error": "Không thể kết nối tới Camera này. Vui lòng kiểm tra cổng cắm hoặc đổi Webcam ID khác."
                 })
                 break
 
@@ -570,79 +579,43 @@ async def websocket_stream(websocket: WebSocket, source: str = "0"):
                 await asyncio.sleep(0.01)
                 continue
 
-            # Read config dynamically per frame (or use loaded config)
             current_config = load_notification_config()
             active_rules = current_config.get("active_rules", {
                 "helmet": True, "vest": True, "boots": False, "gloves": False, "goggles": False
             })
 
-            # Xử lý khung hình với ByteTrack Tracking & Dynamic Active Rules
+            # Xử lý khung hình với RobustViolationTracker
             frame_processed, violations, current_detections, raw_violations = process_frame(
-                frame, use_tracking=True, active_rules=active_rules
+                frame, tracker=tracker, active_rules=active_rules
             )
 
-            current_time = time.time()
+            # 🔥 CHỈ CẢNH BÁO 1 LẦN DUY NHẤT CHO MỖI ID ĐỐI TƯỢNG
+            unalerted_violations = [
+                (v_type, conf, tid)
+                for (v_type, conf, tid, is_alerted) in raw_violations
+                if not is_alerted and not tracker.is_alerted(tid, v_type)
+            ]
 
-            # 1. Dọn dẹp các track_id cũ đã rời khỏi camera > 5s
-            expired_tracks = [tid for tid, last_seen in track_last_seen.items() if (current_time - last_seen) > TRACK_EXPIRATION_SECONDS]
-            for tid in expired_tracks:
-                del track_last_seen[tid]
-                logged_track_violations = {item for item in logged_track_violations if item[0] != tid}
+            if unalerted_violations:
+                # 1. Lưu 1 snapshot duy nhất cho khung hình chứa các vi phạm mới
+                first_v_type, first_conf, first_tid = unalerted_violations[0]
+                snap_info = save_violation_snapshot(frame_processed, first_v_type, first_conf, first_tid)
+                snap_url = snap_info.get("relative_url", "")
+                snap_file = snap_info.get("file_path", "")
 
-            # 2. Xử lý ghi nhận vi phạm không bị lặp lại khi người vi phạm vẫn đứng ở khung hình
-            current_frame_counts: Dict[str, int] = {}
+                for v_type, v_conf, tid in unalerted_violations:
+                    # 2. Đánh dấu ngay lập tức rằng đối tượng ID này ĐÃ ĐƯỢC CẢNH BÁO
+                    tracker.mark_alerted(tid, v_type)
 
-            for v_type, v_conf, track_id in raw_violations:
-                current_frame_counts[v_type] = current_frame_counts.get(v_type, 0) + 1
+                    # 3. Ghi vào CSDL vi phạm
+                    db.add_violation(v_type, v_conf, snap_url)
+                    logger.info(f"🚨 [CẢNH BÁO LẦN ĐẦU] Đối tượng ID #{tid} vi phạm {v_type} ({v_conf:.2f}). Đã chụp snapshot và gửi cảnh báo!")
 
-                if track_id is not None:
-                    track_last_seen[track_id] = current_time
-                    track_key = (track_id, v_type)
-                    # Nếu đối tượng cụ thể (track_id) này CHƯA từng bị ghi nhận lỗi v_type
-                    if track_key not in logged_track_violations:
-                        # 1. Tự động lưu ảnh Snapshot vi phạm
-                        snap_info = save_violation_snapshot(frame_processed, v_type, v_conf, track_id)
-                        snap_url = snap_info.get("relative_url", "")
-                        snap_file = snap_info.get("file_path", "")
-
-                        # 2. Lưu thông tin vào CSDL
-                        db.add_violation(v_type, v_conf, snap_url)
-                        logged_track_violations.add(track_key)
-                        logger.info(f"Đã ghi nhận sự kiện vi phạm mới (Đối tượng #{track_id}): {v_type} ({v_conf:.2f})")
-
-                        # 3. Gửi thông báo tự động (Telegram / Webhook)
-                        asyncio.create_task(send_violation_alert(v_type, v_conf, snap_file, track_id))
-                else:
-                    last_type_seen[v_type] = current_time
-
-            # 3. Fallback xử lý khi không lấy được track_id (chỉ ghi nhận khi số lượng lỗi loại này tăng thêm)
-            for v_type, count in current_frame_counts.items():
-                if any(t_id is None for t, _, t_id in raw_violations if t == v_type):
-                    prev_count = active_type_counts.get(v_type, 0)
-                    if count > prev_count:
-                        new_count = count - prev_count
-                        for _ in range(new_count):
-                            conf = next((c for t, c, tid in raw_violations if t == v_type and tid is None), 0.8)
-                            snap_info = save_violation_snapshot(frame_processed, v_type, conf, None)
-                            snap_url = snap_info.get("relative_url", "")
-                            snap_file = snap_info.get("file_path", "")
-
-                            db.add_violation(v_type, conf, snap_url)
-                            logger.info(f"Đã ghi nhận sự kiện vi phạm mới (Fallback): {v_type} ({conf:.2f})")
-                            asyncio.create_task(send_violation_alert(v_type, conf, snap_file, None))
-                        active_type_counts[v_type] = count
-                    else:
-                        last_type_seen[v_type] = current_time
-
-            # Dọn dẹp trạng thái fallback nếu vi phạm loại này biến mất quá 3s
-            for v_type in list(active_type_counts.keys()):
-                if v_type not in current_frame_counts:
-                    if (current_time - last_type_seen.get(v_type, 0)) > TYPE_PERSISTENCE_SECONDS:
-                        active_type_counts[v_type] = 0
+                    # 4. Gửi thông báo Telegram (chỉ 1 lần duy nhất cho ID này)
+                    asyncio.create_task(send_violation_alert(v_type, v_conf, snap_file, tid))
 
             # Nén ảnh thành định dạng JPG
             _, buffer = cv2.imencode(".jpg", frame_processed, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            # Mã hóa Base64 để gửi qua JSON
             jpg_as_text = base64.b64encode(buffer).decode("utf-8")
 
             # Gửi gói tin trạng thái cập nhật thời gian thực

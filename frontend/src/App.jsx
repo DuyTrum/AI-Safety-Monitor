@@ -59,6 +59,8 @@ function App() {
     }
   });
   const [saveStatus, setSaveStatus] = useState("");
+  const [testTelegramStatus, setTestTelegramStatus] = useState("");
+  const [isTestingTelegram, setIsTestingTelegram] = useState(false);
 
   // Refs & Clock
   const wsRef = useRef(null);
@@ -280,6 +282,36 @@ function App() {
     } catch (e) {
       console.error(e);
       setSaveStatus("❌ Không kết nối được Server!");
+    }
+  };
+
+  // Gửi thử tin nhắn kiểm tra Telegram
+  const handleTestTelegram = async () => {
+    if (!notifySettings.telegram_bot_token || !notifySettings.telegram_chat_id) {
+      setTestTelegramStatus("⚠️ Vui lòng nhập Bot Token và Chat ID trước khi thử!");
+      return;
+    }
+    setIsTestingTelegram(true);
+    setTestTelegramStatus("⏳ Đang gửi tin nhắn thử nghiệm tới Telegram...");
+    try {
+      const res = await fetch(`${API_BASE}/api/settings/notifications/test-telegram`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          token: notifySettings.telegram_bot_token.trim(),
+          chat_id: notifySettings.telegram_chat_id.trim()
+        })
+      });
+      const data = await res.json();
+      if (res.ok && data.status === "success") {
+        setTestTelegramStatus(`✅ ${data.message}`);
+      } else {
+        setTestTelegramStatus(`❌ ${data.message || "Không thể gửi tin nhắn"}`);
+      }
+    } catch (err) {
+      setTestTelegramStatus(`❌ Lỗi kết nối tới Server: ${err.message}`);
+    } finally {
+      setIsTestingTelegram(false);
     }
   };
 
@@ -908,27 +940,69 @@ function App() {
                 </label>
 
                 {notifySettings.telegram_enabled && (
-                  <div style={{ marginTop: "10px", display: "flex", flexDirection: "column", gap: "8px" }}>
+                  <div style={{ marginTop: "10px", display: "flex", flexDirection: "column", gap: "10px" }}>
                     <div>
-                      <span style={{ fontSize: "12px", color: "#94a3b8" }}>Bot Token:</span>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
+                        <span style={{ fontSize: "12px", color: "#94a3b8" }}>Bot Token:</span>
+                        <span style={{ fontSize: "11px", color: "#64748b" }}>Tạo từ @BotFather</span>
+                      </div>
                       <input 
                         type="text"
-                        placeholder="712345678:AAFg..."
+                        placeholder="VD: 7123456789:AAFgAbcDef1234..."
                         value={notifySettings.telegram_bot_token}
                         onChange={(e) => setNotifySettings({ ...notifySettings, telegram_bot_token: e.target.value })}
                         style={inputStyle}
                       />
                     </div>
                     <div>
-                      <span style={{ fontSize: "12px", color: "#94a3b8" }}>Chat ID:</span>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
+                        <span style={{ fontSize: "12px", color: "#94a3b8" }}>Chat ID:</span>
+                        <span style={{ fontSize: "11px", color: "#64748b" }}>Lấy từ @userinfobot hoặc Chat Nhóm</span>
+                      </div>
                       <input 
                         type="text"
-                        placeholder="-100123456789"
+                        placeholder="VD: 123456789 hoặc -100123456789"
                         value={notifySettings.telegram_chat_id}
                         onChange={(e) => setNotifySettings({ ...notifySettings, telegram_chat_id: e.target.value })}
                         style={inputStyle}
                       />
                     </div>
+
+                    <div style={{ display: "flex", gap: "8px", alignItems: "center", marginTop: "4px" }}>
+                      <button
+                        type="button"
+                        onClick={handleTestTelegram}
+                        disabled={isTestingTelegram}
+                        style={{
+                          background: isTestingTelegram ? "#334155" : "#0284c7",
+                          color: "white",
+                          border: "none",
+                          borderRadius: "6px",
+                          padding: "6px 12px",
+                          fontSize: "12px",
+                          fontWeight: "600",
+                          cursor: isTestingTelegram ? "not-allowed" : "pointer",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "6px"
+                        }}
+                      >
+                        {isTestingTelegram ? "⏳ Đang kiểm tra..." : "🧪 Thử gửi thông báo Telegram"}
+                      </button>
+                    </div>
+
+                    {testTelegramStatus && (
+                      <div style={{
+                        fontSize: "12px",
+                        padding: "8px 10px",
+                        borderRadius: "6px",
+                        background: testTelegramStatus.startsWith("✅") ? "rgba(16, 185, 129, 0.15)" : testTelegramStatus.startsWith("⚠️") ? "rgba(245, 158, 11, 0.15)" : "rgba(239, 68, 68, 0.15)",
+                        border: `1px solid ${testTelegramStatus.startsWith("✅") ? "#10b981" : testTelegramStatus.startsWith("⚠️") ? "#f59e0b" : "#ef4444"}`,
+                        color: testTelegramStatus.startsWith("✅") ? "#34d399" : testTelegramStatus.startsWith("⚠️") ? "#fbbf24" : "#f87171"
+                      }}>
+                        {testTelegramStatus}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -955,6 +1029,35 @@ function App() {
                     />
                   </div>
                 )}
+              </div>
+
+              {/* ⏱️ CẤU HÌNH THỜI GIAN COOLDOWN CHỐNG SPAM SNAPSHOT */}
+              <div style={{ marginBottom: "16px", background: "#182238", padding: "12px", borderRadius: "8px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                  <span style={{ fontSize: "13px", fontWeight: "600", color: "#f59e0b" }}>⏱️ Giãn cách chụp Snapshot & Cảnh báo:</span>
+                  <select
+                    value={notifySettings.snapshot_cooldown ?? 15}
+                    onChange={(e) => setNotifySettings({ ...notifySettings, snapshot_cooldown: parseInt(e.target.value, 10) })}
+                    style={{
+                      background: "#0f172a",
+                      color: "white",
+                      border: "1px solid rgba(255,255,255,0.2)",
+                      borderRadius: "6px",
+                      padding: "4px 8px",
+                      fontSize: "12px",
+                      cursor: "pointer"
+                    }}
+                  >
+                    <option value={5}>5 giây (Nhanh)</option>
+                    <option value={10}>10 giây</option>
+                    <option value={15}>15 giây (Mặc định)</option>
+                    <option value={30}>30 giây (Tiết kiệm)</option>
+                    <option value={60}>60 giây (Chống spam cao)</option>
+                  </select>
+                </div>
+                <div style={{ fontSize: "11px", color: "#94a3b8", lineHeight: "1.4" }}>
+                  Tránh chụp ảnh và gửi tin nhắn lặp lại liên tục khi người vi phạm đứng cố định trước camera.
+                </div>
               </div>
 
               {saveStatus && (
