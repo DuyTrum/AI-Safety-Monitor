@@ -16,9 +16,9 @@
     "active_rules": {
       "helmet": true,
       "vest": true,
-      "boots": false,
-      "gloves": false,
-      "goggles": false
+      "boots": true,
+      "gloves": true,
+      "goggles": true
     }
   }
 }

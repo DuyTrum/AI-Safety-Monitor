@@ -134,24 +134,27 @@ class ViolationDB:
     """Quản lý việc lưu trữ và thống kê lịch sử vi phạm (PostgreSQL + In-memory fallback)."""
     
     def __init__(self):
-        self.db_url = os.getenv(
-            "DATABASE_URL", 
-            "postgresql://postgres:postgres@127.0.0.1:5433/safety_monitor"
-        )
+        self.db_url = os.getenv("DATABASE_URL")
+        self.candidate_urls = [
+            self.db_url,
+            "postgresql://postgres:postgres@127.0.0.1:5432/safety_monitor",
+            "postgresql://postgres:postgres@127.0.0.1:5433/safety_monitor",
+        ]
+        self.candidate_urls = [u for u in self.candidate_urls if u]
         self.use_db = False
         self.memory_violations: List[Dict[str, Any]] = []
         self._init_db()
 
     def _get_connection(self):
         """Tạo kết nối mới đến PostgreSQL."""
-        return psycopg2.connect(self.db_url)
+        return psycopg2.connect(self.db_url, connect_timeout=3)
 
     def _init_db(self) -> None:
         """Khởi tạo cơ sở dữ liệu và tạo bảng nếu chưa tồn tại."""
-        retries = 2
-        conn = None
-        while retries > 0:
+        for target_url in self.candidate_urls:
+            conn = None
             try:
+                self.db_url = target_url
                 conn = self._get_connection()
                 with conn.cursor() as cur:
                     cur.execute("""
@@ -168,12 +171,10 @@ class ViolationDB:
                     """)
                     conn.commit()
                 self.use_db = True
-                logger.info("Đã kết nối và khởi tạo thành công CSDL PostgreSQL.")
+                logger.info(f"Đã kết nối và khởi tạo thành công CSDL PostgreSQL tại: {self.db_url}")
                 break
-            except Exception:
-                retries -= 1
-                if retries > 0:
-                    time.sleep(0.5)
+            except Exception as e:
+                logger.debug(f"Không thể kết nối đến {target_url}: {e}")
             finally:
                 if conn:
                     conn.close()
