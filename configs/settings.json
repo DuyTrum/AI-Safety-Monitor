@@ -1,8 +1,8 @@
 {
   "notifications": {
     "telegram_enabled": false,
-    "telegram_bot_token": "8659915774:AAGOorLViVTrJ_szzkKSho6x1U_Mahx7KiU",
-    "telegram_chat_id": "7182988216",
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
     "webhook_enabled": false,
     "webhook_url": "",
     "gemini_api_key": "",

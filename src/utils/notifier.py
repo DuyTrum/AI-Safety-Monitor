@@ -57,11 +57,11 @@ def load_notification_config() -> Dict[str, Any]:
                 loaded["active_rules"] = default_config["active_rules"]
             else:
                 loaded["active_rules"] = {**default_config["active_rules"], **loaded["active_rules"]}
-            # Đảm bảo advanced_features luôn đủ các key
-            if "advanced_features" not in loaded or not isinstance(loaded["advanced_features"], dict):
-                loaded["advanced_features"] = default_config["advanced_features"]
-            else:
-                loaded["advanced_features"] = {**default_config["advanced_features"], **loaded["advanced_features"]}
+            # Hỗ trợ nạp từ biến môi trường nếu cấu hình trống (bảo mật không lộ token trên git)
+            if not loaded.get("telegram_bot_token"):
+                loaded["telegram_bot_token"] = os.getenv("TELEGRAM_BOT_TOKEN", "")
+            if not loaded.get("telegram_chat_id"):
+                loaded["telegram_chat_id"] = os.getenv("TELEGRAM_CHAT_ID", "")
             return loaded
     except Exception as e:
         logger.error(f"Lỗi khi đọc file cấu hình notification: {e}")
