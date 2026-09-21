@@ -440,17 +440,7 @@ def list_available_videos():
         rel_path = f"data/videos/{fname}"
 
         # Đặt tên nhãn mô tả thân thiện hiển thị trên giao diện người dùng
-        if fname.startswith("01_ppe"):
-            label = "1. Kiểm thử PPE 10 lớp (Mũ, Áo, Găng, Ủng, Kính)"
-        elif fname.startswith("02_danger_zone"):
-            label = "2. Xâm nhập Vùng Nguy Hiểm & Xe cơ giới"
-        elif fname.startswith("03_fall_incident"):
-            label = "3. Mô phỏng Sự cố Trượt Ngã (Fall Incident)"
-        elif fname.startswith("04_scaffold"):
-            label = "4. Giàn giáo & Vật thể rơi (Drop Cone)"
-        elif fname.startswith("05_multi_worker"):
-            label = "5. Theo dõi Đa Công nhân (ByteTrack & Khử lặp)"
-        elif fname == "real_ppe_site_01.mp4":
+        if fname == "real_ppe_site_01.mp4":
             label = "🎥 Thực tế: Công Nhân Công Trường Đầy Đủ PPE (11s)"
         elif fname == "real_ppe_site_02.mp4":
             label = "🎥 Thực tế: Công Nhân Vi Phạm Không Áo / Kính (8s)"
@@ -464,10 +454,6 @@ def list_available_videos():
             label = "⚠️ Thực tế: Sự Cố Trượt Ngã Trên Công Trường (5s)"
         elif fname == "worker_zone_detection.mp4":
             label = "🎥 Thực tế: Giám Sát Vùng Thi Công HD (76s)"
-        elif fname == "construction_violation_demo.mp4":
-            label = "Demo: Vi phạm An toàn Công trường"
-        elif fname == "moving_worker_hazard_demo.mp4":
-            label = "Demo: Công nhân di chuyển vào điểm mù"
         else:
             label = fname
 

@@ -599,23 +599,11 @@ function App() {
                   style={{ maxWidth: "360px" }}
                 >
                   <optgroup label="🎥 Video Thực Tế Công Trường (Real Footage)">
-                    {availableVideos
-                      .filter((v) => v.filename.startsWith("real_") || v.filename.startsWith("worker_zone"))
-                      .map((v) => (
-                        <option key={v.path} value={v.path}>
-                          {v.label} ({v.size_mb} MB)
-                        </option>
-                      ))}
-                  </optgroup>
-
-                  <optgroup label="⚙️ Kịch Bản Mô Phỏng Kiểm Thử (Benchmarks)">
-                    {availableVideos
-                      .filter((v) => !v.filename.startsWith("real_") && !v.filename.startsWith("worker_zone"))
-                      .map((v) => (
-                        <option key={v.path} value={v.path}>
-                          {v.label} ({v.size_mb} MB)
-                        </option>
-                      ))}
+                    {availableVideos.map((v) => (
+                      <option key={v.path} value={v.path}>
+                        {v.label} ({v.size_mb} MB)
+                      </option>
+                    ))}
                   </optgroup>
 
                   <optgroup label="📹 Nguồn Trực Tiếp & Giả Lập">

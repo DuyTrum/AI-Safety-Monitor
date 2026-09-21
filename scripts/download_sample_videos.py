@@ -169,7 +169,7 @@ def list_available_videos() -> None:
     print("=" * 75)
 
     if not video_files:
-        print("Chưa có video nào trong thư mục. Chạy `python scripts/generate_test_videos.py` để tạo.")
+        print("Chưa có video nào trong thư mục. Tải thêm bằng `python scripts/download_sample_videos.py --url <URL_VIDEO>`.")
         return
 
     for idx, v in enumerate(video_files, start=1):
