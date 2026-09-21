@@ -47,9 +47,20 @@ const IconGear = () => (
   </svg>
 );
 
+const IconSparkles = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/>
+    <path d="M5 3v4"/>
+    <path d="M19 17v4"/>
+    <path d="M3 5h4"/>
+    <path d="M17 19h4"/>
+  </svg>
+);
+
 function App() {
   // Trạng thái nguồn video & WebSocket
-  const [videoSource, setVideoSource] = useState("mock");
+  const [videoSource, setVideoSource] = useState("data/videos/real_ppe_site_01.mp4");
+  const [availableVideos, setAvailableVideos] = useState([]);
   const [customPath, setCustomPath] = useState("");
   const [streamActive, setStreamActive] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -66,8 +77,8 @@ function App() {
     goggles: false
   });
 
-  // Âm thanh cảnh báo
-  const [audioEnabled, setAudioEnabled] = useState(true);
+  // Âm thanh cảnh báo (Mặc định tắt hoàn toàn theo yêu cầu)
+  const [audioEnabled, setAudioEnabled] = useState(false);
   const audioContextRef = useRef(null);
 
   // Thống kê & Nhật ký
@@ -79,6 +90,27 @@ function App() {
   });
   const [violationLog, setViolationLog] = useState([]);
   const [logFilter, setLogFilter] = useState("all");
+  const [riskSummary, setRiskSummary] = useState({
+    total_tracked: 0,
+    safe_count: 0,
+    warning_count: 0,
+    danger_count: 0,
+    average_wri: 0.0,
+    assessments: []
+  });
+
+  // Mô phỏng Vật lý Tai nạn & Trợ lý What-If
+  const [simulationSummary, setSimulationSummary] = useState({
+    physics_enabled: true,
+    drop_cones_count: 0,
+    ghost_falls_count: 0,
+    active_simulations: []
+  });
+  const [physicsSimEnabled, setPhysicsSimEnabled] = useState(true);
+  const [showWhatIfModal, setShowWhatIfModal] = useState(false);
+  const [whatIfLoading, setWhatIfLoading] = useState(false);
+  const [whatIfScenario, setWhatIfScenario] = useState(null);
+  const [selectedViolationForWhatIf, setSelectedViolationForWhatIf] = useState("tool_drop_hazard");
 
   // Modals
   const [showSettingsModal, setShowSettingsModal] = useState(false);
@@ -164,9 +196,24 @@ function App() {
     }
   };
 
+  const fetchVideos = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/videos`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.videos && data.videos.length > 0) {
+          setAvailableVideos(data.videos);
+        }
+      }
+    } catch (e) {
+      console.debug("Video load error:", e);
+    }
+  };
+
   useEffect(() => {
     fetchStatsAndLogs();
     fetchSettings();
+    fetchVideos();
     const interval = setInterval(fetchStatsAndLogs, 4000);
     return () => clearInterval(interval);
   }, []);
@@ -182,7 +229,8 @@ function App() {
       setCurrentViolations([]);
     } else {
       setStreamError(null);
-      const sourceParam = videoSource === "custom" ? customPath : videoSource;
+      const defaultCustom = "data/videos/real_fall_incident.mp4";
+      const sourceParam = videoSource === "custom" ? (customPath.trim() || defaultCustom) : videoSource;
       const wsUrl = `${WS_BASE}/api/ws/stream?source=${encodeURIComponent(sourceParam)}`;
 
       const ws = new WebSocket(wsUrl);
@@ -205,12 +253,16 @@ function App() {
           setFrame(data.frame);
           if (data.violations && data.violations.length > 0) {
             setCurrentViolations(data.violations);
-            playAlertSound();
+            if (audioEnabled) {
+              playAlertSound();
+            }
           } else {
             setCurrentViolations([]);
           }
           if (data.current_detections) setCurrentDetections(data.current_detections);
           if (data.active_rules) setNotifySettings((prev) => ({ ...prev, active_rules: data.active_rules }));
+          if (data.risk_summary) setRiskSummary(data.risk_summary);
+          if (data.simulation_summary) setSimulationSummary(data.simulation_summary);
           if (data.stats) setStats(data.stats);
         } catch (err) {
           console.error("WS Parse error:", err);
@@ -230,43 +282,67 @@ function App() {
     }
   };
 
-  // Toggle nhanh quy định an toàn
+  // Tải dữ liệu ban đầu
+  const fetchInitialData = useCallback(async () => {
+    try {
+      const [resStats, resLogs, resSettings] = await Promise.all([
+        fetch(`${API_BASE}/api/stats`),
+        fetch(`${API_BASE}/api/violations?limit=50`),
+        fetch(`${API_BASE}/api/settings/notifications`)
+      ]);
+      if (resStats.ok) setStats(await resStats.json());
+      if (resLogs.ok) setViolationLog(await resLogs.json());
+      if (resSettings.ok) {
+        const s = await resSettings.json();
+        setNotifySettings(s);
+        if (s.advanced_features && s.advanced_features.physics_simulation_enabled !== undefined) {
+          setPhysicsSimEnabled(s.advanced_features.physics_simulation_enabled);
+        }
+      }
+    } catch (e) {
+      console.error("Lỗi tải dữ liệu ban đầu:", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchInitialData();
+  }, [fetchInitialData]);
+
+  // Bật/Tắt quy tắc an toàn
   const handleToggleRule = async (ruleKey) => {
-    const current = notifySettings.active_rules?.[ruleKey] ?? true;
-    const updatedRules = {
-      ...(notifySettings.active_rules || {}),
-      [ruleKey]: !current
+    const updated = {
+      ...notifySettings.active_rules,
+      [ruleKey]: !notifySettings.active_rules[ruleKey]
     };
-    const updated = { ...notifySettings, active_rules: updatedRules };
-    setNotifySettings(updated);
+    const newSettings = { ...notifySettings, active_rules: updated };
+    setNotifySettings(newSettings);
 
     try {
       await fetch(`${API_BASE}/api/settings/notifications`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(updated)
+        body: JSON.stringify(newSettings)
       });
     } catch (e) {
-      console.error("Update rule error:", e);
+      console.error("Lỗi cập nhật quy định:", e);
     }
   };
 
-  // Xóa nhật ký
+  // Xóa lịch sử vi phạm
   const handleClearHistory = async () => {
-    if (window.confirm("Xóa toàn bộ nhật ký vi phạm hiện tại?")) {
-      try {
-        const res = await fetch(`${API_BASE}/api/violations`, { method: "DELETE" });
-        if (res.ok) {
-          setViolationLog([]);
-          fetchStatsAndLogs();
-        }
-      } catch (e) {
-        console.error("Clear error:", e);
+    if (!window.confirm("Bạn có chắc chắn muốn xóa toàn bộ lịch sử vi phạm không?")) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/violations`, { method: "DELETE" });
+      if (res.ok) {
+        setViolationLog([]);
+        setStats((prev) => ({ ...prev, total_violations: 0, violations_today: 0, compliance_rate: 100.0, class_stats: {} }));
       }
+    } catch (e) {
+      console.error("Lỗi khi xóa lịch sử:", e);
     }
   };
 
-  // Lưu cấu hình Telegram
+  // Lưu cấu hình Cảnh báo
   const handleSaveSettings = async (e) => {
     e.preventDefault();
     setSaveStatus("Đang lưu...");
@@ -276,21 +352,16 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(notifySettings)
       });
-      if (res.ok) {
-        setSaveStatus("Đã lưu thành công!");
-        setTimeout(() => setSaveStatus(""), 2500);
-      }
-    } catch (e) {
-      setSaveStatus("Lỗi kết nối.");
+      const data = await res.json();
+      setSaveStatus(res.ok && data.status === "success" ? "Đã lưu thành công!" : `Lỗi: ${data.message}`);
+      setTimeout(() => setSaveStatus(""), 3000);
+    } catch (err) {
+      setSaveStatus(`Lỗi: ${err.message}`);
     }
   };
 
-  // Test Telegram
+  // Test gửi Telegram
   const handleTestTelegram = async () => {
-    if (!notifySettings.telegram_bot_token || !notifySettings.telegram_chat_id) {
-      setTestTelegramStatus("Nhập đủ Token và Chat ID.");
-      return;
-    }
     setIsTestingTelegram(true);
     setTestTelegramStatus("Đang gửi test...");
     try {
@@ -315,6 +386,51 @@ function App() {
   const handleExportReport = (period) => {
     window.open(`${API_BASE}/api/reports/export?period=${period}&format=excel`, "_blank");
     setShowReportModal(false);
+  };
+
+  // Bật/Tắt mô phỏng vật lý
+  const handleTogglePhysicsSim = async () => {
+    const nextState = !physicsSimEnabled;
+    setPhysicsSimEnabled(nextState);
+    try {
+      await fetch(`${API_BASE}/api/simulation/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ physics_simulation_enabled: nextState }),
+      });
+    } catch (err) {
+      console.error("Lỗi cập nhật cấu hình mô phỏng:", err);
+    }
+  };
+
+  // Kích hoạt phân tích What-If
+  const handleTriggerWhatIf = async (hazardType = "tool_drop_hazard", context = {}) => {
+    setShowWhatIfModal(true);
+    setWhatIfLoading(true);
+    setWhatIfScenario(null);
+    setSelectedViolationForWhatIf(hazardType);
+
+    try {
+      const resp = await fetch(`${API_BASE}/api/simulation/what-if`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          violation_type: hazardType,
+          context_data: context,
+          image_base64: frame || null,
+        }),
+      });
+      const data = await resp.json();
+      if (data.status === "success") {
+        setWhatIfScenario(data.scenario);
+      } else {
+        alert("Lỗi phân tích: " + (data.message || "Không xác định"));
+      }
+    } catch (err) {
+      console.error("Lỗi gọi API What-If:", err);
+    } finally {
+      setWhatIfLoading(false);
+    }
   };
 
   // Map tên vi phạm & mức độ
@@ -358,6 +474,25 @@ function App() {
 
         <div className="nav-right">
           <div className="clock-text">{currentTime}</div>
+
+          <button
+            className={`c-btn c-btn-ghost ${physicsSimEnabled ? "btn-sim-active" : ""}`}
+            onClick={handleTogglePhysicsSim}
+            title={physicsSimEnabled ? "Tắt mô phỏng vật lý" : "Bật mô phỏng vật lý"}
+          >
+            <IconSparkles />
+            <span>{physicsSimEnabled ? "Mô Phỏng: BẬT" : "Mô Phỏng: TẮT"}</span>
+          </button>
+
+          <button
+            className="c-btn c-btn-ghost"
+            onClick={() => handleTriggerWhatIf(currentViolations[0] || "tool_drop_hazard")}
+            style={{ color: "#a78bfa", borderColor: "rgba(167, 139, 250, 0.4)" }}
+            title="Kích hoạt phân tích kịch bản tai nạn What-If"
+          >
+            <IconSparkles />
+            <span>Kịch Bản What-If</span>
+          </button>
 
           <button
             className="c-btn c-btn-ghost c-btn-icon"
@@ -461,22 +596,45 @@ function App() {
                   value={videoSource}
                   onChange={(e) => setVideoSource(e.target.value)}
                   disabled={streamActive}
+                  style={{ maxWidth: "360px" }}
                 >
-                  <option value="mock">Video Mẫu (Mock)</option>
-                  <option value="0">Webcam Máy Tính (ID 0)</option>
-                  <option value="1">Webcam Ngoài (ID 1)</option>
-                  <option value="custom">Camera IP (RTSP/File)</option>
+                  <optgroup label="🎥 Video Thực Tế Công Trường (Real Footage)">
+                    {availableVideos
+                      .filter((v) => v.filename.startsWith("real_") || v.filename.startsWith("worker_zone"))
+                      .map((v) => (
+                        <option key={v.path} value={v.path}>
+                          {v.label} ({v.size_mb} MB)
+                        </option>
+                      ))}
+                  </optgroup>
+
+                  <optgroup label="⚙️ Kịch Bản Mô Phỏng Kiểm Thử (Benchmarks)">
+                    {availableVideos
+                      .filter((v) => !v.filename.startsWith("real_") && !v.filename.startsWith("worker_zone"))
+                      .map((v) => (
+                        <option key={v.path} value={v.path}>
+                          {v.label} ({v.size_mb} MB)
+                        </option>
+                      ))}
+                  </optgroup>
+
+                  <optgroup label="📹 Nguồn Trực Tiếp & Giả Lập">
+                    <option value="mock">Luồng Giả Lập Mẫu (Mock Slideshow)</option>
+                    <option value="0">Webcam Máy Tính (ID 0)</option>
+                    <option value="1">Webcam Ngoài USB (ID 1)</option>
+                    <option value="custom">Camera IP (RTSP) / Đường dẫn tùy biến</option>
+                  </optgroup>
                 </select>
 
                 {videoSource === "custom" && (
                   <input
                     type="text"
                     className="c-input"
-                    placeholder="rtsp://..."
+                    placeholder="data/videos/...mp4 hoặc rtsp://..."
                     value={customPath}
                     onChange={(e) => setCustomPath(e.target.value)}
                     disabled={streamActive}
-                    style={{ width: "160px" }}
+                    style={{ width: "260px" }}
                   />
                 )}
               </div>
@@ -564,11 +722,11 @@ function App() {
                   Chưa có vi phạm nào
                 </div>
               ) : (
-                filteredLogs.map((log) => {
+                filteredLogs.map((log, idx) => {
                   const b = getViolationBadge(log.type);
                   const time = new Date(log.timestamp).toLocaleTimeString('vi-VN');
                   return (
-                    <div key={log.id} className={`incident-row ${b.border}`}>
+                    <div key={`${log.id || 'log'}-${idx}`} className={`incident-row ${b.border}`}>
                       {log.snapshot_url && (
                         <div
                           className="incident-thumb-sq"
@@ -585,6 +743,14 @@ function App() {
                         </div>
                         <div className="incident-line2">
                           <span>Độ tin cậy: {Math.round(log.confidence * 100)}%</span>
+                          <button
+                            className="c-btn c-btn-ghost"
+                            style={{ padding: "2px 8px", fontSize: "10px", height: "20px", color: "#c084fc", borderColor: "rgba(192, 132, 252, 0.4)" }}
+                            onClick={() => handleTriggerWhatIf(log.type, { confidence: log.confidence })}
+                            title="Mô phỏng kịch bản What-If cho vi phạm này"
+                          >
+                            🔮 What-If
+                          </button>
                         </div>
                       </div>
                     </div>
@@ -687,6 +853,26 @@ function App() {
                   </div>
                 )}
 
+                <div style={{ borderTop: "1px solid var(--border-dim)", paddingTop: "10px", marginTop: "6px" }}>
+                  <div style={{ fontSize: "12px", fontWeight: "700", color: "#c084fc", marginBottom: "4px" }}>
+                    🧠 Trợ Lý What-If VLM (Tùy chọn)
+                  </div>
+                  <div style={{ fontSize: "11px", color: "var(--text-dim)", marginBottom: "6px" }}>
+                    Mặc định chạy ngoại tuyến (Offline Expert System). Nếu nhập Gemini API Key, AI sẽ phân tích ngữ cảnh hình ảnh chi tiết.
+                  </div>
+                  <div>
+                    <div style={{ fontSize: "11px", color: "var(--text-dim)", marginBottom: "3px" }}>Google Gemini API Key:</div>
+                    <input
+                      type="password"
+                      className="c-input"
+                      style={{ width: "100%" }}
+                      placeholder="AIzaSy..."
+                      value={notifySettings.gemini_api_key || ""}
+                      onChange={(e) => setNotifySettings({ ...notifySettings, gemini_api_key: e.target.value })}
+                    />
+                  </div>
+                </div>
+
                 {saveStatus && <div style={{ fontSize: "11px", color: "var(--status-safe)" }}>{saveStatus}</div>}
               </div>
               <div className="modal-foot">
@@ -694,6 +880,180 @@ function App() {
                 <button type="submit" className="c-btn c-btn-primary">Lưu</button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* 4. MODAL PHÂN TÍCH KỊCH BẢN TAI NẠN WHAT-IF */}
+      {showWhatIfModal && (
+        <div className="modal-overlay" onClick={() => setShowWhatIfModal(false)}>
+          <div className="whatif-modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <IconSparkles />
+                <span>TRỢ LÝ AI: PHÂN TÍCH KỊCH BẢN TAI NẠN (WHAT-IF AUDITOR)</span>
+              </div>
+              <button
+                onClick={() => setShowWhatIfModal(false)}
+                style={{ background: "transparent", border: "none", color: "var(--text-dim)", cursor: "pointer", fontSize: "16px" }}
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="modal-content" style={{ overflowY: "auto", maxHeight: "75vh" }}>
+              {/* Thanh chọn nhanh nguy cơ để mô phỏng */}
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "8px" }}>
+                <span style={{ fontSize: "12px", color: "var(--text-dim)" }}>Chọn nhanh tình huống thử nghiệm:</span>
+                <div className="whatif-quick-selector">
+                  {[
+                    { type: "tool_drop_hazard", label: "🔨 Rơi Dụng Cụ" },
+                    { type: "on_scaffold_unhooked", label: "🧗 Không Móc Dây Neo" },
+                    { type: "fall_detected", label: "🚨 Té Ngã Bất Động" },
+                    { type: "zone_intrusion", label: "🚧 Vào Hố Móng / Vùng Cấm" },
+                    { type: "no-helmet", label: "👷 Không Đội Mũ" },
+                  ].map((item) => (
+                    <button
+                      key={item.type}
+                      className={`whatif-chip-btn ${selectedViolationForWhatIf === item.type ? "whatif-chip-active" : ""}`}
+                      onClick={() => handleTriggerWhatIf(item.type)}
+                      disabled={whatIfLoading}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {whatIfLoading ? (
+                <div style={{ textAlign: "center", padding: "40px 20px" }}>
+                  <div style={{ color: "var(--accent)", fontSize: "14px", fontWeight: "600", marginBottom: "8px" }}>
+                    Đang phân tích chuỗi rủi ro & mô phỏng kịch bản tai nạn...
+                  </div>
+                  <div style={{ fontSize: "12px", color: "var(--text-dim)" }}>
+                    Đang đối chiếu tiêu chuẩn OSHA 1926 & QCVN 18:2021/BXD
+                  </div>
+                </div>
+              ) : whatIfScenario ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+                  {/* Banner Tên Kịch Bản & Cấp Độ */}
+                  <div className="whatif-banner">
+                    <div>
+                      <div className="whatif-banner-title">
+                        <span>⚠️ {whatIfScenario.title}</span>
+                      </div>
+                      <div style={{ fontSize: "12px", color: "var(--text-dim)", marginTop: "4px" }}>
+                        Mã vi phạm: <strong style={{ color: "#fff" }}>{whatIfScenario.hazard_type}</strong> • Tiêu chuẩn: {whatIfScenario.osha_standard}
+                      </div>
+                      {whatIfScenario.statistical_basis && (
+                        <div style={{ fontSize: "11px", color: "#94a3b8", marginTop: "4px", fontStyle: "italic" }}>
+                          📊 Cơ sở định lượng: {whatIfScenario.statistical_basis}
+                        </div>
+                      )}
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: "4px" }}>
+                      <span className="whatif-badge-mode">{whatIfScenario.source_mode}</span>
+                      <span style={{ fontSize: "13px", fontWeight: "700", color: "var(--status-danger)" }}>
+                        Xác suất: {whatIfScenario.probability_pct}% ({whatIfScenario.probability_level})
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Thông số Động học / Vật lý nếu có */}
+                  {whatIfScenario.impact_energy_joules && (
+                    <div className="whatif-physics-callout">
+                      <div className="whatif-metric-card">
+                        <div className="whatif-metric-label">Động Năng Va Đập</div>
+                        <div className="whatif-metric-val" style={{ color: "#f43f5e" }}>
+                          {whatIfScenario.impact_energy_joules} J
+                        </div>
+                      </div>
+                      <div className="whatif-metric-card">
+                        <div className="whatif-metric-label">Ngưỡng Vỡ Sọ Não</div>
+                        <div className="whatif-metric-val" style={{ color: "#f59e0b" }}>
+                          ~50 J
+                        </div>
+                      </div>
+                      <div className="whatif-metric-card">
+                        <div className="whatif-metric-label">Cấp Độ Nguy Hiểm</div>
+                        <div className="whatif-metric-val" style={{ color: "#f43f5e" }}>
+                          {whatIfScenario.severity_level}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Chuỗi rủi ro (Hazard Chain) */}
+                  <div>
+                    <div style={{ fontSize: "13px", fontWeight: "700", color: "#fff", marginBottom: "6px" }}>
+                      🔗 Chuỗi Rủi Ro & Cơ Chế Tai Nạn (Hazard Chain):
+                    </div>
+                    <div className="whatif-chain-container">
+                      {whatIfScenario.root_cause_chain.map((step) => (
+                        <div key={step.step} className="whatif-chain-step">
+                          <div className="whatif-step-num">{step.step}</div>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                              <span style={{ fontSize: "13px", fontWeight: "700", color: "#fff" }}>{step.title}</span>
+                              <span style={{ fontSize: "11px", fontFamily: "var(--font-mono)", color: "var(--status-warning)" }}>
+                                {step.time_offset}
+                              </span>
+                            </div>
+                            <p style={{ fontSize: "12px", color: "var(--text-body)", marginTop: "3px" }}>
+                              {step.description}
+                            </p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Hậu quả mô phỏng */}
+                  <div style={{ background: "var(--bg-surface-elevated)", padding: "10px 14px", borderRadius: "6px", border: "1px solid var(--border-dim)" }}>
+                    <div style={{ fontSize: "13px", fontWeight: "700", color: "#f87171", marginBottom: "6px" }}>
+                      💥 Hậu Quả & Chấn Thương Mô Phỏng:
+                    </div>
+                    <ul style={{ paddingLeft: "18px", fontSize: "12px", display: "flex", flexDirection: "column", gap: "4px" }}>
+                      {whatIfScenario.simulated_consequences.map((cons, cIdx) => (
+                        <li key={cIdx} style={{ color: "var(--text-body)" }}>{cons}</li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  {/* Hành động khẩn cấp */}
+                  <div className="whatif-actions-box">
+                    <div className="whatif-actions-title">
+                      <span>🛡️ Danh Mục Hành Động Khẩn Cấp (HSE Action Checklist):</span>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: "6px", fontSize: "12px" }}>
+                      {whatIfScenario.immediate_actions.map((act, aIdx) => (
+                        <div key={aIdx} style={{ display: "flex", alignItems: "flex-start", gap: "6px" }}>
+                          <span>{act}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="modal-foot">
+              <button
+                type="button"
+                className="c-btn c-btn-ghost"
+                onClick={() => handleTriggerWhatIf(selectedViolationForWhatIf)}
+                disabled={whatIfLoading}
+              >
+                🔄 Phân Tích Lại
+              </button>
+              <button
+                type="button"
+                className="c-btn c-btn-primary"
+                onClick={() => setShowWhatIfModal(false)}
+              >
+                Đóng
+              </button>
+            </div>
           </div>
         </div>
       )}

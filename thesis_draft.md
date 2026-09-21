@@ -49,6 +49,12 @@ Hệ thống giám sát an toàn lao động được thiết kế theo mô hìn
 4. **Report Generator Subsystem**: Trích xuất dữ liệu vi phạm theo mốc thời gian (*Hôm nay, Tuần này, Tháng này, Tất cả*) ra tệp báo cáo Excel (`.xlsx` 3 sheet chuyên nghiệp) hoặc CSV phục vụ công tác nghiệm thu.
 5. **FastAPI Web Server & PostgreSQL DB**: Cung cấp API REST, truyền luồng video WebSocket thời gian thực, lưu vết lịch sử vi phạm kèm URL snapshot vào PostgreSQL.
 6. **React Frontend Dashboard**: Nhận dữ liệu truyền từ WebSocket, hiển thị luồng stream kèm nhãn ByteTrack, xem trực tiếp ảnh snapshot dạng Lightbox popup, xuất báo cáo Excel và cấu hình Telegram Bot ngay trên giao diện.
+7. **Safety Relation Reasoning Engine (RelateAnything Integration)**: Tiếp nhận Bounding Boxes từ YOLO11s và ByteTrack, suy luận các bộ ba quan hệ ngữ nghĩa mở `(Subject) --[Predicate]--> (Object)` theo thời gian thực (~20ms). Phân tích tương tác người - máy móc - giàn giáo để nhận diện các nguy cơ tai nạn nghiêm trọng theo chuẩn OSHA Focus Four (điểm mù xe nâng, làm việc dưới cẩu treo, ngã cao).
+
+### 2.3. Mô hình Suy luận Quan hệ Thị giác Mở (Open-Vocabulary Scene Graph Generation - RelateAnything)
+Nhận diện đối tượng (Object Detection) thuần túy chỉ trả lời câu hỏi *"Có vật thể gì và ở đâu?"*, nhưng không giải thích được *"Các vật thể đang tương tác với nhau như thế nào?"*. Để giải quyết bài toán cốt lõi này trong giám sát công trường, nghiên cứu tích hợp kiến trúc **RelateAnything** (*Maëlic Neau et al., 2026*):
+- **Đặc tính Open-Vocabulary**: Hệ thống không bị cố định bởi tập nhãn quan hệ hạn hẹp mà có thể cấu hình từ vựng linh hoạt thời gian thực (`hooked to`, `standing in blind spot of`, `walking in path of`, `working underneath`).
+- **Đồ thị Ngữ cảnh An toàn (Safety Scene Graph)**: Biểu diễn hiện trường thành đồ thị tri thức động, kết nối trực tiếp vào bộ chỉ số rủi ro động WRI v2.0 (Dynamic Worker Risk Index) và mô-đun phân tích kịch bản tai nạn giả định What-If Auditor.
 
 ---
 
@@ -138,6 +144,7 @@ Thiết lập này giúp hệ thống hoạt động đồng bộ, dễ dàng nh
 - Huấn luyện thành công mô hình YOLO11s đạt độ chính xác mAP50 trên 95% ở các trang bị an toàn chính và độ nhạy Recall cao ở các lớp vi phạm nghiêm trọng.
 - Xây dựng hoàn chỉnh luồng xử lý video trực tiếp qua WebSocket từ backend sang frontend dashboard với độ trễ < 15ms.
 - Hoàn thành thiết kế Dashboard giám sát an toàn lao động với giao diện UI hiện đại, tích hợp âm thanh cảnh báo tự động.
+- Tích hợp thành công phân hệ Suy luận Quan hệ Thị giác Mở (Open-Vocabulary Scene Graph Reasoning với RelateAnything) giúp chuyển đổi hệ thống từ nhận diện vật thể cơ bản sang thấu hiểu ngữ cảnh tương tác người - máy móc - giàn giáo thời gian thực.
 - Triển khai thành công bằng Docker Container hóa giúp rút ngắn thời gian cài đặt và vận hành hệ thống.
 
 ### 6.2. Hướng phát triển tiếp theo

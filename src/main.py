@@ -3,8 +3,10 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import cv2
+import numpy as np
 import json
 import time
+import uuid
 import base64
 import logging
 import asyncio
@@ -30,6 +32,14 @@ from src.utils.notifier import (
 )
 from src.utils.reporter import generate_violation_report
 from src.utils.tracker import RobustViolationTracker
+from src.modules.zone_manager import ZoneManager, SafetyZone, ZoneType, ZoneSeverity
+from src.modules.pose_engine import PoseEngine, PoseAnalysisResult
+from src.modules.scaffold_harness_monitor import ScaffoldHarnessMonitor, HeightViolationType
+from src.modules.risk_predictor import RiskPredictor, RiskLevel
+from src.modules.physics_simulator import PhysicsSimulator, DroppedObjectSimulation, GhostFallSimulation
+from src.modules.whatif_auditor import WhatIfAuditor, WhatIfScenario
+from src.modules.relation_engine import SafetyRelationEngine, SafetyRelationTriplet, RelationHazardSeverity
+from src.utils.text_utils import strip_accents
 
 # Cấu hình logging
 logging.basicConfig(
@@ -61,7 +71,10 @@ app.mount("/static/snapshots", StaticFiles(directory=SNAPSHOT_BASE_DIR), name="s
 MODEL_PATH = os.getenv("MODEL_PATH", "weights/best.pt")
 VIOLATIONS_FILE = "runs/violations.json"
 
-UNSAFE_CLASSES = {"no-boots", "no-gloves", "no-goggles", "no-helmet", "no-vest"}
+UNSAFE_CLASSES = {
+    "no-boots", "no-gloves", "no-goggles", "no-helmet", "no-vest",
+    "fall_detected", "zone_intrusion", "on_scaffold_no_harness", "on_scaffold_unhooked", "tool_drop_hazard"
+}
 SAFE_CLASSES = {"boots", "gloves", "goggles", "helmet", "vest"}
 
 # Phân loại màu sắc (BGR)
@@ -94,6 +107,19 @@ except Exception as e:
     logger.error(f"Lỗi tải mô hình YOLO: {e}")
     model = None
 
+# Khởi tạo các module an toàn mở rộng (Geofencing, Pose, Scaffold, Risk Engine, Physics Simulation, What-If Auditor, Relation Reasoning)
+zone_manager = ZoneManager("configs/zones.json")
+pose_engine = PoseEngine(model_path="yolo11n-pose.pt")
+scaffold_monitor = ScaffoldHarnessMonitor()
+risk_predictor = RiskPredictor()
+physics_simulator = PhysicsSimulator()
+relation_engine = SafetyRelationEngine()
+
+initial_cfg = load_notification_config()
+whatif_auditor = WhatIfAuditor(
+    gemini_api_key=initial_cfg.get("gemini_api_key", os.getenv("GEMINI_API_KEY", ""))
+)
+
 # Mô hình dữ liệu Pydantic
 class ViolationEvent(BaseModel):
     id: str
@@ -115,8 +141,13 @@ class NotificationSettingsModel(BaseModel):
     telegram_chat_id: str = ""
     webhook_enabled: bool = False
     webhook_url: str = ""
+    gemini_api_key: str = ""
+    vlm_provider: str = "offline_expert"
     snapshot_cooldown: int = 15
-    notify_violations: List[str] = ["no-helmet", "no-vest", "no-gloves", "no-boots", "no-goggles"]
+    notify_violations: List[str] = [
+        "no-helmet", "no-vest", "no-gloves", "no-boots", "no-goggles",
+        "fall_detected", "zone_intrusion", "on_scaffold_no_harness", "on_scaffold_unhooked", "tool_drop_hazard"
+    ]
     active_rules: Dict[str, bool] = {
         "helmet": True,
         "vest": True,
@@ -124,6 +155,40 @@ class NotificationSettingsModel(BaseModel):
         "gloves": False,
         "goggles": False
     }
+    advanced_features: Dict[str, bool] = {
+        "danger_zones_enabled": True,
+        "fall_detection_enabled": True,
+        "scaffold_harness_enabled": True,
+        "risk_prediction_enabled": True,
+        "physics_simulation_enabled": True,
+        "drop_cone_enabled": True,
+        "ghost_fall_enabled": True,
+        "relation_reasoning_enabled": True,
+    }
+
+class ZoneModel(BaseModel):
+    zone_id: str
+    name: str
+    zone_type: str = "restricted_access"
+    points: List[List[int]]
+    severity: str = "danger"
+    is_active: bool = True
+    penalty_score: float = 75.0
+
+class WhatIfRequest(BaseModel):
+    violation_type: str
+    context_data: Optional[Dict[str, Any]] = None
+    image_base64: Optional[str] = None
+
+class SimulationConfigModel(BaseModel):
+    physics_simulation_enabled: Optional[bool] = None
+    drop_cone_enabled: Optional[bool] = None
+    ghost_fall_enabled: Optional[bool] = None
+    gemini_api_key: Optional[str] = None
+    vlm_provider: Optional[str] = None
+
+class RelationVocabularyModel(BaseModel):
+    vocabulary: List[str]
 
 class TelegramTestRequest(BaseModel):
     token: Optional[str] = None
@@ -185,7 +250,7 @@ class ViolationDB:
     def add_violation(self, violation_type: str, confidence: float, snapshot_url: str = "") -> Dict[str, Any]:
         """Thêm sự kiện vi phạm mới."""
         now = datetime.now()
-        event_id = f"evt_{int(time.time() * 1000)}"
+        event_id = f"evt_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
         event = {
             "id": event_id,
             "timestamp": now.isoformat(),
@@ -357,6 +422,193 @@ def test_telegram_notification(req: Optional[TelegramTestRequest] = None):
     return {"status": "error", "message": message}
 
 
+# API Quản lý Video Kiểm Thử (Test Video Management)
+@app.get("/api/videos")
+def list_available_videos():
+    """Liệt kê toàn bộ các video kiểm thử có sẵn trong thư mục data/videos/."""
+    videos_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "videos"))
+    if not os.path.exists(videos_dir):
+        return {"status": "success", "videos": []}
+
+    video_files = sorted(
+        [os.path.join(videos_dir, f) for f in os.listdir(videos_dir) if f.lower().endswith((".mp4", ".avi", ".mov"))]
+    )
+    result = []
+    for vf in video_files:
+        fname = os.path.basename(vf)
+        size_mb = round(os.path.getsize(vf) / (1024 * 1024), 2)
+        rel_path = f"data/videos/{fname}"
+
+        # Đặt tên nhãn mô tả thân thiện hiển thị trên giao diện người dùng
+        if fname.startswith("01_ppe"):
+            label = "1. Kiểm thử PPE 10 lớp (Mũ, Áo, Găng, Ủng, Kính)"
+        elif fname.startswith("02_danger_zone"):
+            label = "2. Xâm nhập Vùng Nguy Hiểm & Xe cơ giới"
+        elif fname.startswith("03_fall_incident"):
+            label = "3. Mô phỏng Sự cố Trượt Ngã (Fall Incident)"
+        elif fname.startswith("04_scaffold"):
+            label = "4. Giàn giáo & Vật thể rơi (Drop Cone)"
+        elif fname.startswith("05_multi_worker"):
+            label = "5. Theo dõi Đa Công nhân (ByteTrack & Khử lặp)"
+        elif fname == "real_ppe_site_01.mp4":
+            label = "🎥 Thực tế: Công Nhân Công Trường Đầy Đủ PPE (11s)"
+        elif fname == "real_ppe_site_02.mp4":
+            label = "🎥 Thực tế: Công Nhân Vi Phạm Không Áo / Kính (8s)"
+        elif fname == "real_ppe_site_03.mp4":
+            label = "🎥 Thực tế: Nhóm Công Nhân Di Chuyển Trên Sàn (12s)"
+        elif fname == "real_construction_site_raw_01.mp4":
+            label = "🎥 Thực tế: Thi Công Cắt Thép & Máy Móc Công Trường (65s)"
+        elif fname == "real_construction_scaffold_raw.mp4":
+            label = "🎥 Thực tế: Công Nhân Làm Việc Trên Giàn Giáo (12s)"
+        elif fname == "real_fall_incident.mp4":
+            label = "⚠️ Thực tế: Sự Cố Trượt Ngã Trên Công Trường (5s)"
+        elif fname == "worker_zone_detection.mp4":
+            label = "🎥 Thực tế: Giám Sát Vùng Thi Công HD (76s)"
+        elif fname == "construction_violation_demo.mp4":
+            label = "Demo: Vi phạm An toàn Công trường"
+        elif fname == "moving_worker_hazard_demo.mp4":
+            label = "Demo: Công nhân di chuyển vào điểm mù"
+        else:
+            label = fname
+
+        result.append({
+            "filename": fname,
+            "label": label,
+            "path": rel_path,
+            "size_mb": size_mb,
+        })
+
+    return {"status": "success", "videos": result}
+
+
+# API Quản lý Vùng Nguy hiểm Ảo (Geofencing Zones) & Đánh giá Rủi ro
+@app.get("/api/zones")
+def get_zones():
+    """Lấy danh sách các vùng nguy hiểm đang được cấu hình."""
+    return {"status": "success", "zones": [z.to_dict() for z in zone_manager.list_zones()]}
+
+
+@app.post("/api/zones")
+def add_or_update_zone(zone_req: ZoneModel):
+    """Thêm hoặc cập nhật một vùng nguy hiểm ảo."""
+    data = zone_req.dict()
+    new_zone = SafetyZone.from_dict(data)
+    zone_manager.add_zone(new_zone)
+    zone_manager.save_to_file("configs/zones.json")
+    return {"status": "success", "zone": new_zone.to_dict()}
+
+
+@app.delete("/api/zones/{zone_id}")
+def delete_zone(zone_id: str):
+    """Xóa một vùng nguy hiểm ảo."""
+    removed = zone_manager.remove_zone(zone_id)
+    if removed:
+        zone_manager.save_to_file("configs/zones.json")
+        return {"status": "success", "message": f"Đã xóa vùng {zone_id}"}
+    return {"status": "error", "message": "Không tìm thấy vùng cần xóa"}
+
+
+@app.get("/api/risk/summary")
+def get_risk_summary():
+    """Lấy báo cáo tổng hợp các tính năng an toàn dự đoán."""
+    return {
+        "status": "success",
+        "active_zones_count": len([z for z in zone_manager.list_zones() if z.is_active]),
+        "features": {
+            "pose_estimation": pose_engine.model is not None,
+            "danger_geofencing": True,
+            "scaffold_monitoring": True,
+            "predictive_wri": True,
+            "physics_simulation": True,
+            "what_if_auditor": True,
+        },
+    }
+
+
+# API Mô phỏng Tai nạn & Trợ lý What-If Safety Auditor
+@app.post("/api/simulation/what-if")
+def generate_what_if_scenario(req: WhatIfRequest):
+    """Phân tích kịch bản tai nạn What-If (Offline Expert System hoặc Gemini VLM)."""
+    try:
+        scenario = whatif_auditor.generate_scenario(
+            violation_type=req.violation_type,
+            context_data=req.context_data,
+            image_base64=req.image_base64,
+        )
+        return {"status": "success", "scenario": scenario.to_dict()}
+    except Exception as e:
+        logger.error(f"Lỗi phân tích kịch bản What-If: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/simulation/config")
+def get_simulation_config():
+    """Lấy thông tin cấu hình mô phỏng vật lý và VLM."""
+    cfg = load_notification_config()
+    adv = cfg.get("advanced_features", {})
+    return {
+        "physics_simulation_enabled": adv.get("physics_simulation_enabled", True),
+        "drop_cone_enabled": adv.get("drop_cone_enabled", True),
+        "ghost_fall_enabled": adv.get("ghost_fall_enabled", True),
+        "vlm_provider": cfg.get("vlm_provider", "offline_expert"),
+        "has_gemini_key": bool(whatif_auditor.gemini_api_key),
+    }
+
+
+@app.post("/api/simulation/config")
+def update_simulation_config(sim_cfg: SimulationConfigModel):
+    """Cập nhật tham số mô phỏng và khóa API Gemini."""
+    cfg = load_notification_config()
+    if "advanced_features" not in cfg:
+        cfg["advanced_features"] = {}
+
+    if sim_cfg.physics_simulation_enabled is not None:
+        cfg["advanced_features"]["physics_simulation_enabled"] = sim_cfg.physics_simulation_enabled
+        physics_simulator.is_enabled = sim_cfg.physics_simulation_enabled
+
+    if sim_cfg.drop_cone_enabled is not None:
+        cfg["advanced_features"]["drop_cone_enabled"] = sim_cfg.drop_cone_enabled
+
+    if sim_cfg.ghost_fall_enabled is not None:
+        cfg["advanced_features"]["ghost_fall_enabled"] = sim_cfg.ghost_fall_enabled
+
+    if sim_cfg.gemini_api_key is not None:
+        cfg["gemini_api_key"] = sim_cfg.gemini_api_key
+        whatif_auditor.set_api_key(sim_cfg.gemini_api_key)
+
+    if sim_cfg.vlm_provider is not None:
+        cfg["vlm_provider"] = sim_cfg.vlm_provider
+
+    success = save_notification_config(cfg)
+    if success:
+        return {"status": "success", "message": "Đã lưu cấu hình mô phỏng mới."}
+    return {"status": "error", "message": "Lỗi lưu cấu hình mô phỏng."}
+
+
+# API Quản lý Từ vựng Quan hệ Thị giác (Scene Graph Vocabulary)
+@app.get("/api/relations/vocabulary")
+def get_relation_vocabulary():
+    """Lấy danh mục từ vựng quan hệ an toàn hiện tại."""
+    return {
+        "status": "success",
+        "vocabulary": relation_engine.vocabulary,
+        "is_deep_learning_active": relation_engine.is_deep_learning_active,
+        "model_name": relation_engine.model_name,
+        "device": relation_engine.device,
+    }
+
+
+@app.post("/api/relations/vocabulary")
+def update_relation_vocabulary(data: RelationVocabularyModel):
+    """Cập nhật từ vựng quan hệ an toàn tùy biến cho RelateAnything."""
+    relation_engine.set_vocabulary(data.vocabulary)
+    return {
+        "status": "success",
+        "message": "Đã cập nhật danh mục từ vựng quan hệ an toàn.",
+        "vocabulary": relation_engine.vocabulary,
+    }
+
+
 # Quản lý WebSocket Streams
 class ConnectionManager:
     """Quản lý các kết nối WebSocket của máy khách."""
@@ -383,24 +635,41 @@ def process_frame(
     frame: cv2.Mat,
     tracker: Optional[RobustViolationTracker] = None,
     active_rules: Optional[Dict[str, bool]] = None,
-) -> tuple[cv2.Mat, List[str], Dict[str, bool], List[tuple[str, float, int, bool]]]:
-    """Chạy suy luận YOLO11 và theo dõi ID đối tượng bằng RobustViolationTracker.
-    
+    advanced_features: Optional[Dict[str, bool]] = None,
+) -> tuple[cv2.Mat, List[str], Dict[str, bool], List[tuple[str, float, int, bool]], Dict[str, Any], Dict[str, Any]]:
+    """Chạy suy luận YOLO11, ước lượng tư thế YOLO-Pose, kiểm soát vùng nguy hiểm và mô phỏng vật lý tai nạn.
+
     Args:
         frame: Ảnh gốc từ camera (OpenCV Mat).
         tracker: Bộ theo dõi đối tượng Spatial-Temporal RobustViolationTracker.
         active_rules: Dictionary cấu hình bật/tắt các quy định bảo hộ.
-        
+        advanced_features: Dictionary cấu hình bật/tắt các tính năng nâng cao.
+
     Returns:
-        frame_out: Ảnh đã được vẽ bounding box và cảnh báo.
+        frame_out: Ảnh đã được vẽ bounding box, skeleton, zones, risk HUD và physics simulation.
         violations: Danh sách các lớp vi phạm phát hiện trong frame.
         current_detections: Trạng thái an toàn của từng loại trang bị.
         raw_violations: Danh sách tuple chứa (class_name, confidence, track_id, is_already_alerted).
+        risk_summary: Báo cáo phân bố rủi ro an toàn lao động thời gian thực.
+        simulation_summary: Dữ liệu mô phỏng vật lý nón rơi và bóng ma trượt ngã.
     """
     if active_rules is None:
         config = load_notification_config()
         active_rules = config.get("active_rules", {
             "helmet": True, "vest": True, "boots": False, "gloves": False, "goggles": False
+        })
+
+    if advanced_features is None:
+        config = load_notification_config()
+        advanced_features = config.get("advanced_features", {
+            "danger_zones_enabled": True,
+            "fall_detection_enabled": True,
+            "scaffold_harness_enabled": True,
+            "risk_prediction_enabled": True,
+            "physics_simulation_enabled": True,
+            "drop_cone_enabled": True,
+            "ghost_fall_enabled": True,
+            "relation_reasoning_enabled": True,
         })
 
     current_detections = {
@@ -411,33 +680,52 @@ def process_frame(
         "goggles": False
     }
 
-    if model is None or frame is None or frame.size == 0:
-        return frame, [], current_detections, []
+    default_risk_summary = {
+        "total_tracked": 0,
+        "safe_count": 0,
+        "warning_count": 0,
+        "danger_count": 0,
+        "average_wri": 0.0,
+        "assessments": [],
+    }
 
-    # 1. Chạy YOLO11 phát hiện đối tượng
-    try:
-        results = model(frame, conf=0.25, verbose=False)
-    except Exception as e:
-        logger.error(f"Lỗi suy luận YOLO: {e}")
-        return frame, [], current_detections, []
+    default_simulation_summary = {
+        "physics_enabled": False,
+        "drop_cones_count": 0,
+        "ghost_falls_count": 0,
+        "active_simulations": [],
+    }
 
+    if frame is None or frame.size == 0:
+        return frame, [], current_detections, [], default_risk_summary, default_simulation_summary
+
+    # 1. Vẽ các vùng nguy hiểm ảo (Geofencing Zones)
+    if advanced_features.get("danger_zones_enabled", True):
+        frame = zone_manager.draw_zones_on_frame(frame)
+
+    # 2. Chạy YOLO11 phát hiện đối tượng trang bị bảo hộ (PPE)
     raw_detections = []
-    if results and len(results) > 0:
-        boxes = results[0].boxes
-        for box in boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-            conf = float(box.conf[0])
-            class_id = int(box.cls[0])
-            class_name = model.names[class_id]
+    if model is not None:
+        try:
+            results = model(frame, conf=0.25, verbose=False)
+            if results and len(results) > 0:
+                boxes = results[0].boxes
+                for box in boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                    conf = float(box.conf[0])
+                    class_id = int(box.cls[0])
+                    class_name = model.names[class_id]
 
-            # Kiểm tra quy định bảo hộ tương ứng có đang BẬT không
-            base_rule = class_name.replace("no-", "")
-            if not active_rules.get(base_rule, True):
-                continue
+                    # Kiểm tra quy định bảo hộ tương ứng có đang BẬT không
+                    base_rule = class_name.replace("no-", "")
+                    if not active_rules.get(base_rule, True):
+                        continue
 
-            raw_detections.append(((x1, y1, x2, y2), class_name, conf))
+                    raw_detections.append(((x1, y1, x2, y2), class_name, conf))
+        except Exception as e:
+            logger.error(f"Lỗi suy luận YOLO PPE: {e}")
 
-    # 2. Cập nhật qua Spatial-Temporal Tracker để gán ID bền vững
+    # 3. Cập nhật qua Spatial-Temporal Tracker để gán ID bền vững
     tracked_items = []
     if tracker is not None:
         tracked_items = tracker.update(raw_detections, timestamp=time.time())
@@ -448,7 +736,61 @@ def process_frame(
     violations = []
     raw_violations = []
 
-    # 3. Vẽ Bounding Box trực quan
+    # 4. Phân tích tư thế và phát hiện Té ngã (YOLO11-Pose)
+    pose_results = []
+    if advanced_features.get("fall_detection_enabled", True) and pose_engine.model is not None:
+        tracked_boxes = [(t[0], t[1]) for t in tracked_items]
+        pose_results = pose_engine.analyze_frame(frame, tracked_person_bboxes=tracked_boxes)
+        frame = pose_engine.draw_pose_on_frame(frame, pose_results)
+        for pr in pose_results:
+            if pr.is_fallen:
+                tid = pr.track_id or 1
+                violations.append("fall_detected")
+                raw_violations.append(("fall_detected", pr.confidence, tid, False))
+
+    # 5. Kiểm tra Xâm nhập Vùng nguy hiểm ảo
+    if advanced_features.get("danger_zones_enabled", True):
+        for track_id, (x1, y1, x2, y2), class_name, conf, is_alerted in tracked_items:
+            intrusions = zone_manager.check_bbox_intrusion((x1, y1, x2, y2))
+            if intrusions:
+                violations.append("zone_intrusion")
+                raw_violations.append(("zone_intrusion", 0.95, track_id, is_alerted))
+
+    # 5.5. Phân tích Quan hệ Ngữ cảnh Thị giác (Scene Graph / RelateAnything)
+    relation_triplets = []
+    if advanced_features.get("relation_reasoning_enabled", True) and len(tracked_items) >= 2:
+        detections_for_rel = [(t[0], t[1], t[2], t[3]) for t in tracked_items]
+        relation_triplets = relation_engine.infer_safety_relations(frame, detections_for_rel)
+        if relation_triplets:
+            frame = relation_engine.draw_relations_on_frame(frame, relation_triplets)
+            for trip in relation_triplets:
+                if trip.is_hazard:
+                    haz_type = f"relation_{trip.predicate.lower().replace(' ', '_')}"
+                    violations.append(haz_type)
+                    raw_violations.append((haz_type, trip.confidence, trip.subject_id, False))
+
+    # 6. Giám sát An toàn Giàn giáo, Thang và Dây đai an toàn
+    scaffold_statuses = []
+    if advanced_features.get("scaffold_harness_enabled", True):
+        scaffold_boxes = []
+        for z in zone_manager.list_zones():
+            if z.is_active and z.zone_type == ZoneType.SCAFFOLD_DROP_ZONE:
+                pts = np.array(z.points)
+                sx1, sy1 = int(pts[:, 0].min()), int(pts[:, 1].min())
+                sx2, sy2 = int(pts[:, 0].max()), int(pts[:, 1].max())
+                scaffold_boxes.append((1, (sx1, sy1, sx2, sy2)))
+
+        for track_id, (x1, y1, x2, y2), class_name, conf, is_alerted in tracked_items:
+            st = scaffold_monitor.evaluate_worker_height_safety(
+                track_id, (x1, y1, x2, y2), [class_name], scaffold_boxes, relation_triplets=relation_triplets
+            )
+            scaffold_statuses.append(st)
+            if st.violation_type:
+                vtype = st.violation_type.value
+                violations.append(vtype)
+                raw_violations.append((vtype, 0.90, track_id, is_alerted))
+
+    # 7. Vẽ Bounding Box cơ bản cho các trang bị PPE
     for track_id, (x1, y1, x2, y2), class_name, conf, is_alerted in tracked_items:
         base_rule = class_name.replace("no-", "")
 
@@ -457,40 +799,151 @@ def process_frame(
             raw_violations.append((class_name, conf, track_id, is_alerted))
 
             if is_alerted:
-                # Đã cảnh báo rồi: Viền cam đậm, ghi rõ [ID #X] VI PHAM (DA BAO)
                 color = (0, 140, 255)  # BGR Orange
                 status_text = "DA BAO"
             else:
-                # Chưa cảnh báo: Viền đỏ rực, ghi rõ [ID #X] VI PHAM (MOI)
                 color = COLORS["unsafe"]  # BGR Red
                 status_text = "MOI"
 
             label = f"[ID #{track_id}] {class_name.upper()} ({status_text}) {conf:.2f}"
         else:
-            # Trang bị an toàn
             color = COLORS["safe"]  # BGR Green
             label = f"[ID #{track_id}] {class_name} ({conf:.2f})"
             if base_rule in current_detections:
                 current_detections[base_rule] = True
 
-        # Vẽ hình chữ nhật bounding box
+        label = strip_accents(label)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-        # Vẽ nền label
         text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
         cv2.rectangle(frame, (x1, y1 - 22), (x1 + text_size[0] + 6, y1), color, -1)
-
-        # Viết text label
         cv2.putText(frame, label, (x1 + 3, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+    # 8. Tính toán Chỉ số Rủi ro Công nhân Động (WRI) & Vẽ Risk HUD
+    risk_assessments = []
+    if advanced_features.get("risk_prediction_enabled", True):
+        missing_by_track: Dict[int, List[str]] = {}
+        for track_id, (x1, y1, x2, y2), class_name, conf, is_alerted in tracked_items:
+            if class_name in UNSAFE_CLASSES:
+                missing_by_track.setdefault(track_id, []).append(class_name)
+
+        seen_tracks = set()
+        for track_id, bbox, class_name, conf, is_alerted in tracked_items:
+            if track_id in seen_tracks:
+                continue
+            seen_tracks.add(track_id)
+
+            pr = next((p for p in pose_results if p.track_id == track_id), None)
+            hs = next((s for s in scaffold_statuses if s.track_id == track_id), None)
+            intrusions = zone_manager.check_bbox_intrusion(bbox)
+            missing = missing_by_track.get(track_id, [])
+
+            wri_res = risk_predictor.calculate_wri(
+                track_id=track_id,
+                worker_bbox=bbox,
+                missing_ppe_items=missing,
+                pose_result=pr,
+                height_status=hs,
+                intrusions=intrusions,
+                zone_manager=zone_manager,
+                relation_triplets=relation_triplets,
+            )
+            risk_assessments.append(wri_res)
+
+        frame = risk_predictor.draw_risk_hud(frame, risk_assessments)
+
+    risk_summary = {
+        "total_tracked": len(risk_assessments),
+        "safe_count": len([r for r in risk_assessments if r.risk_level == RiskLevel.SAFE]),
+        "warning_count": len([r for r in risk_assessments if r.risk_level == RiskLevel.WARNING]),
+        "danger_count": len([r for r in risk_assessments if r.risk_level == RiskLevel.DANGER]),
+        "average_wri": round(
+            sum(r.wri_score for r in risk_assessments) / max(1, len(risk_assessments)), 1
+        ) if risk_assessments else 0.0,
+        "assessments": [
+            {
+                "track_id": r.track_id,
+                "wri": r.wri_score,
+                "level": r.risk_level.value,
+                "tags": r.active_hazard_tags,
+                "recommendation": r.recommendation,
+            }
+            for r in risk_assessments
+        ],
+    }
+
+    # 9. Mô phỏng Vật lý Tai nạn Thời gian thực (Drop Cone & Ghost Fall Trajectory)
+    drop_simulations = []
+    ghost_simulations = []
+    if advanced_features.get("physics_simulation_enabled", True):
+        all_worker_boxes = [(t[0], t[1]) for t in tracked_items]
+        h_frame = frame.shape[0]
+
+        # A. Chiếu Nón Nguy Hiểm Rơi (Hazard Drop Cone) nếu có công nhân trên cao hoặc cảnh báo vật rơi
+        if advanced_features.get("drop_cone_enabled", True):
+            for st in scaffold_statuses:
+                if st.is_on_scaffold or st.violation_type:
+                    wx1, wy1, wx2, wy2 = st.worker_bbox
+                    sim_tool_box = (wx1, max(0, wy1 - 25), min(frame.shape[1], wx1 + 35), wy1)
+                    drop_sim = physics_simulator.simulate_dropped_tool(
+                        tool_bbox=sim_tool_box,
+                        frame_height=h_frame,
+                        tool_name="tool_generic",
+                        worker_bboxes=all_worker_boxes,
+                    )
+                    drop_simulations.append(drop_sim)
+                    break
+
+        # B. Quét nguy cơ trượt ngã (Ghost Fall Trajectory)
+        if advanced_features.get("ghost_fall_enabled", True):
+            for pr in pose_results:
+                if pr.is_bending_risk or pr.is_fallen or pr.torso_angle > 35.0:
+                    ghost_sim = physics_simulator.simulate_worker_ghost_fall(
+                        track_id=pr.track_id or 1,
+                        worker_bbox=pr.bbox,
+                        frame_height=h_frame,
+                        fall_cause="POSTURE_LOSS" if not pr.is_fallen else "FALLEN_IMPACT",
+                    )
+                    ghost_simulations.append(ghost_sim)
+                    break
+
+        frame = physics_simulator.draw_physics_hud(frame, drop_simulations, ghost_simulations)
+
+    simulation_summary = {
+        "physics_enabled": advanced_features.get("physics_simulation_enabled", True),
+        "drop_cones_count": len(drop_simulations),
+        "ghost_falls_count": len(ghost_simulations),
+        "active_simulations": [
+            {
+                "type": "drop_cone",
+                "label": d.source_label,
+                "height_m": d.estimated_height_m,
+                "mass_kg": d.object_mass_kg,
+                "impact_joules": d.impact_energy_joules,
+                "velocity_kmh": d.impact_velocity_kmh,
+                "severity": d.severity.value,
+                "workers_at_risk": d.workers_at_risk,
+            }
+            for d in drop_simulations
+        ] + [
+            {
+                "type": "ghost_fall",
+                "track_id": g.track_id,
+                "cause": g.fall_cause,
+                "time_to_impact": g.time_to_impact_s,
+                "impact_joules": g.simulated_impact_joules,
+            }
+            for g in ghost_simulations
+        ],
+    }
 
     # Hiển thị thông tin cảnh báo tổng quan góc trên bên trái
     if violations:
-        violation_text = f"CANH BAO: {len(violations)} vi pham!"
+        violation_text = strip_accents(f"CANH BAO: {len(violations)} nguy co!")
         cv2.putText(frame, violation_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, COLORS["unsafe"], 2)
     else:
         cv2.putText(frame, "AN TOAN LAO DONG", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, COLORS["safe"], 2)
 
-    return frame, violations, current_detections, raw_violations
+    return frame, violations, current_detections, raw_violations, risk_summary, simulation_summary
 
 
 @app.websocket("/api/ws/stream")
@@ -510,6 +963,9 @@ async def websocket_stream(websocket: WebSocket, source: str = "0"):
     if source.isdigit():
         video_source = int(source)
         logger.info(f"Khởi chạy luồng từ Webcam ID: {video_source}")
+    elif source == "mock":
+        video_source = "mock"
+        logger.info("Khởi chạy luồng ảnh giả lập (Mock Stream).")
     else:
         video_source = os.path.abspath(source)
         if not os.path.exists(video_source):
@@ -553,8 +1009,9 @@ async def websocket_stream(websocket: WebSocket, source: str = "0"):
 
     try:
         while True:
+            loop_start = time.time()
             frame = None
-            
+
             if cap is not None and cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
@@ -563,6 +1020,11 @@ async def websocket_stream(websocket: WebSocket, source: str = "0"):
                         continue
                     else:
                         break
+
+                # Nếu video gốc có tốc độ 60 FPS, bỏ qua 1 frame xen kẽ để phát chuẩn tốc độ 1x không bị chậm
+                native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                if native_fps > 45:
+                    cap.grab()
             elif mock_images:
                 # Đọc ảnh giả lập tuần hoàn với nhịp 1.5s mỗi ảnh để quan sát rõ ràng
                 img_path = mock_images[mock_idx % len(mock_images)]
@@ -580,14 +1042,26 @@ async def websocket_stream(websocket: WebSocket, source: str = "0"):
                 await asyncio.sleep(0.01)
                 continue
 
+            # Tối ưu kích thước khung hình: Resize về chiều rộng 720px để suy luận AI và truyền WebSocket cực nhanh (<15ms)
+            h, w = frame.shape[:2]
+            if w > 720:
+                scale = 720.0 / w
+                frame = cv2.resize(frame, (720, int(h * scale)), interpolation=cv2.INTER_AREA)
+
             current_config = load_notification_config()
             active_rules = current_config.get("active_rules", {
                 "helmet": True, "vest": True, "boots": False, "gloves": False, "goggles": False
             })
+            advanced_features = current_config.get("advanced_features", {
+                "danger_zones_enabled": False,
+                "fall_detection_enabled": True,
+                "scaffold_harness_enabled": False,
+                "risk_prediction_enabled": True,
+            })
 
-            # Xử lý khung hình với RobustViolationTracker
-            frame_processed, violations, current_detections, raw_violations = process_frame(
-                frame, tracker=tracker, active_rules=active_rules
+            # Xử lý khung hình với RobustViolationTracker và các module an toàn mở rộng
+            frame_processed, violations, current_detections, raw_violations, risk_summary, simulation_summary = process_frame(
+                frame, tracker=tracker, active_rules=active_rules, advanced_features=advanced_features
             )
 
             # 🔥 CHỈ CẢNH BÁO 1 LẦN DUY NHẤT CHO MỖI ID ĐỐI TƯỢNG
@@ -615,8 +1089,8 @@ async def websocket_stream(websocket: WebSocket, source: str = "0"):
                     # 4. Gửi thông báo Telegram (chỉ 1 lần duy nhất cho ID này)
                     asyncio.create_task(send_violation_alert(v_type, v_conf, snap_file, tid))
 
-            # Nén ảnh thành định dạng JPG
-            _, buffer = cv2.imencode(".jpg", frame_processed, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            # Nén ảnh thành định dạng JPG (chất lượng 70 giúp truyền mượt mà không chiếm băng thông)
+            _, buffer = cv2.imencode(".jpg", frame_processed, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
             jpg_as_text = base64.b64encode(buffer).decode("utf-8")
 
             # Gửi gói tin trạng thái cập nhật thời gian thực
@@ -625,13 +1099,19 @@ async def websocket_stream(websocket: WebSocket, source: str = "0"):
                 "violations": violations,
                 "current_detections": current_detections,
                 "active_rules": active_rules,
+                "advanced_features": advanced_features,
+                "risk_summary": risk_summary,
+                "simulation_summary": simulation_summary,
                 "stats": db.get_stats()
             }
             await manager.send_json(message, websocket)
             
-            # Khống chế FPS luồng truyền ở mức ~25-30 FPS để tránh ngập mạng (sleep ~33ms)
+            # Tính toán độ trễ động (Dynamic delay) để luồng video phát mượt chuẩn thời gian thực (~30 FPS)
+            loop_elapsed = time.time() - loop_start
+            target_fps = 30.0
+            sleep_needed = max(0.002, (1.0 / target_fps) - loop_elapsed)
             if cap is not None:
-                await asyncio.sleep(0.03)
+                await asyncio.sleep(sleep_needed)
 
     except WebSocketDisconnect:
         manager.disconnect(websocket)

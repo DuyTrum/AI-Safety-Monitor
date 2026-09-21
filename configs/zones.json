@@ -1,0 +1,18 @@
+{
+  "zones": [
+    {
+      "zone_id": "zone_machinery_01",
+      "name": "Khu vực Xe cơ giới / Máy đào",
+      "zone_type": "machinery_proximity",
+      "points": [
+        [320, 160],
+        [620, 160],
+        [620, 460],
+        [320, 460]
+      ],
+      "severity": "danger",
+      "is_active": true,
+      "penalty_score": 85.0
+    }
+  ]
+}

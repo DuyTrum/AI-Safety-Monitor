@@ -1,24 +1,40 @@
 {
   "notifications": {
     "telegram_enabled": false,
-    "telegram_bot_token": "",
-    "telegram_chat_id": "",
+    "telegram_bot_token": "8659915774:AAGOorLViVTrJ_szzkKSho6x1U_Mahx7KiU",
+    "telegram_chat_id": "7182988216",
     "webhook_enabled": false,
     "webhook_url": "",
+    "gemini_api_key": "",
+    "vlm_provider": "offline_expert",
     "snapshot_cooldown": 15,
     "notify_violations": [
       "no-helmet",
       "no-vest",
       "no-gloves",
       "no-boots",
-      "no-goggles"
+      "no-goggles",
+      "fall_detected",
+      "zone_intrusion",
+      "on_scaffold_no_harness",
+      "on_scaffold_unhooked",
+      "tool_drop_hazard"
     ],
     "active_rules": {
       "helmet": true,
       "vest": true,
-      "boots": true,
-      "gloves": true,
-      "goggles": true
+      "boots": false,
+      "gloves": false,
+      "goggles": false
+    },
+    "advanced_features": {
+      "danger_zones_enabled": false,
+      "fall_detection_enabled": true,
+      "scaffold_harness_enabled": false,
+      "risk_prediction_enabled": true,
+      "physics_simulation_enabled": true,
+      "drop_cone_enabled": true,
+      "ghost_fall_enabled": true
     }
   }
 }

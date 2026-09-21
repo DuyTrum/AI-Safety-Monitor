@@ -132,6 +132,20 @@ python src/train.py --model yolo11s.pt --data data/ppe_dataset/data.yaml --epoch
 python src/export.py --model weights/best.pt --format onnx --imgsz 640
 ```
 
+### 5. Bộ Video Kiểm Thử Công Trường (Test Video Suite) & Quy Trình Kiểm Thử
+Hệ thống tích hợp sẵn bộ 5 video kiểm thử chuyên biệt chuẩn 720p 25fps cho từng kịch bản nghiệp vụ:
+```bash
+# Tự động sinh trọn bộ 5 video kiểm thử kịch bản:
+python scripts/generate_test_videos.py
+
+# Xem danh sách và kiểm tra thông số kỹ thuật các video có sẵn:
+python scripts/download_sample_videos.py --list
+
+# Tải thêm video thực tế từ YouTube hoặc nguồn mở:
+python scripts/download_sample_videos.py --url <URL_VIDEO> --name custom_cctv.mp4
+```
+> 📄 Xem chi tiết **Quy trình kiểm thử 12 tính năng chuẩn ISO/IEC/IEEE 29119 & QCVN 18:2021/BXD** tại: [`QUY_TRINH_KIEM_THU_TOAN_BO_CHUC_NANG.md`](QUY_TRINH_KIEM_THU_TOAN_BO_CHUC_NANG.md).
+
 ---
 
 ## 📁 Cấu Trúc Thư Mục Dự Án

@@ -39,6 +39,12 @@ def load_notification_config() -> Dict[str, Any]:
             "gloves": False,
             "goggles": False,
         },
+        "advanced_features": {
+            "danger_zones_enabled": True,
+            "fall_detection_enabled": True,
+            "scaffold_harness_enabled": True,
+            "risk_prediction_enabled": True,
+        },
     }
     if not os.path.exists(CONFIG_FILE):
         return default_config
@@ -51,6 +57,11 @@ def load_notification_config() -> Dict[str, Any]:
                 loaded["active_rules"] = default_config["active_rules"]
             else:
                 loaded["active_rules"] = {**default_config["active_rules"], **loaded["active_rules"]}
+            # Đảm bảo advanced_features luôn đủ các key
+            if "advanced_features" not in loaded or not isinstance(loaded["advanced_features"], dict):
+                loaded["advanced_features"] = default_config["advanced_features"]
+            else:
+                loaded["advanced_features"] = {**default_config["advanced_features"], **loaded["advanced_features"]}
             return loaded
     except Exception as e:
         logger.error(f"Lỗi khi đọc file cấu hình notification: {e}")
@@ -228,6 +239,11 @@ async def send_violation_alert(
         "no-gloves": "⚠️ KHÔNG ĐEO GĂNG TAY",
         "no-boots": "⚠️ KHÔNG ĐI ỦNG BẢO HỘ",
         "no-goggles": "⚠️ KHÔNG ĐEO KÍNH BẢO HỘ",
+        "fall_detected": "🚨🚨 KHẨN CẤP: PHÁT HIỆN CÔNG NHÂN TÉ NGÃ / BẤT ĐỘNG",
+        "zone_intrusion": "🚨 XÂM NHẬP VÙNG NGUY HIỂM / HỐ MÓNG",
+        "on_scaffold_no_harness": "🚨 NGUY CƠ TỬ VONG: TRÊN GIÀN GIÁO KHÔNG CÓ DÂY ĐAI AN TOÀN",
+        "on_scaffold_unhooked": "⚠️ NGUY HIỂM: TRÊN GIÀN GIÁO CHƯA MÓC CHỐT NEO",
+        "tool_drop_hazard": "⚠️ NGUY CƠ: DỤNG CỤ LAO ĐỘNG SÁT MÉP SÀN / RƠI TỰ DO",
     }
     violation_title = labels_map.get(violation_type, f"🚨 VI PHẠM: {violation_type.upper()}")
     track_str = f"\n🔹 <b>Đối tượng:</b> #{track_id}" if track_id is not None else ""
